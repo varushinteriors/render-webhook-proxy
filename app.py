@@ -1,5 +1,6 @@
 import asyncio
 import json
+import mimetypes
 import os
 from collections import deque
 from datetime import datetime, time, timedelta, timezone
@@ -12,6 +13,7 @@ from fastapi import FastAPI, Request, Response, HTTPException, Query, Header
 from pydantic import BaseModel
 
 from agents.lead_scoring import LeadInput, LeadScoringAgent
+from services.drive_client import DriveClient
 
 app = FastAPI()
 
@@ -42,9 +44,21 @@ LEAD_SCORE_PATH = Path(os.getenv("LEAD_SCORE_PATH", "logs/lead-scores.json"))
 LEAD_SCORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETINGS_PATH = Path(os.getenv("MEETINGS_PATH", "logs/meetings.json"))
 MEETINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+LEAD_ENGAGEMENT_PATH = Path(os.getenv("LEAD_ENGAGEMENT_PATH", "logs/lead-engagement.json"))
+LEAD_ENGAGEMENT_PATH.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "").strip()
+SECONDARY_LEAD_TOKEN = os.getenv("LEAD_ACCESS_TOKEN", "").strip()
+LEAD_ACCESS_TOKEN = PAGE_ACCESS_TOKEN or SECONDARY_LEAD_TOKEN or WHATSAPP_ACCESS_TOKEN
+ADMIN_ALERT_NUMBERS = [n.strip() for n in os.getenv("ADMIN_ALERT_NUMBERS", "").split(",") if n.strip()]
+DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID", "1L-LHTKvA-l9gxtWaxH68JlMZQ2Glg2ql")
+PORTFOLIO_LINK = os.getenv(
+    "DRIVE_PORTFOLIO_LINK",
+    "https://drive.google.com/drive/folders/1WBJf_7zCLb5XxpbryxCSoUiKc13DzerC",
+)
+GRAPH_API_BASE = "https://graph.facebook.com/v20.0"
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "").strip()
 SECONDARY_LEAD_TOKEN = os.getenv("LEAD_ACCESS_TOKEN", "").strip()
 LEAD_ACCESS_TOKEN = PAGE_ACCESS_TOKEN or SECONDARY_LEAD_TOKEN or WHATSAPP_ACCESS_TOKEN
@@ -55,6 +69,10 @@ MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro
 IST = ZoneInfo("Asia/Kolkata")
 
 scoring_agent = LeadScoringAgent()
+drive_client = DriveClient(
+    os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+    DRIVE_PARENT_FOLDER_ID,
+)
 
 QUESTION_FLOW = [
     "name",
@@ -79,7 +97,7 @@ QUESTION_PROMPTS = {
     "finish": "What finish level would you like—budget-friendly, premium, or luxury?",
     "budget": "What budget bracket should we plan for? (<10 lacs, 10–20 lacs, 20–30 lacs, >30 lacs, or flexible as per design.)",
     "assets": "Do you have any layouts or site photos you can share here?",
-    "portfolio": "Would you like me to send over our latest work portfolio?",
+    "portfolio": f"Would you like to see our latest work portfolio? Here’s a quick look: {PORTFOLIO_LINK}",
 }
 
 INACTIVITY_INITIAL_DELAY = 180  # seconds (3 minutes)
@@ -246,15 +264,16 @@ async def _auto_reply(payload: Dict[str, Any]) -> None:
             business_phone_id = metadata.get("phone_number_id")
             contacts = value.get("contacts", [])
             for message in messages:
-                # Skip non-text or messages originating from our own number
-                if message.get("type") != "text":
-                    continue
                 wa_id = message.get("from")
                 if not wa_id or wa_id == business_phone_id:
                     continue
-                text_body = message.get("text", {}).get("body", "").strip()
-                contact_name = _match_contact_name(contacts, wa_id)
-                await _handle_conversation_turn(wa_id, contact_name, text_body)
+                msg_type = message.get("type")
+                if msg_type == "text":
+                    text_body = message.get("text", {}).get("body", "").strip()
+                    contact_name = _match_contact_name(contacts, wa_id)
+                    await _handle_conversation_turn(wa_id, contact_name, text_body)
+                else:
+                    await _handle_media_message(wa_id, msg_type, message, contacts)
 
 
 def _match_contact_name(contacts: List[Dict[str, Any]], wa_id: str) -> str | None:
@@ -263,6 +282,33 @@ def _match_contact_name(contacts: List[Dict[str, Any]], wa_id: str) -> str | Non
             profile = contact.get("profile", {})
             return profile.get("name")
     return None
+
+
+async def _handle_media_message(
+    wa_id: str,
+    msg_type: str,
+    message: Dict[str, Any],
+    contacts: List[Dict[str, Any]],
+) -> None:
+    media_info = message.get(msg_type, {}) or {}
+    media_id = media_info.get("id")
+    if not media_id:
+        return
+    download = await _download_whatsapp_media(media_id)
+    if not download:
+        return
+    data, mime_type, filename = download
+    contact_name = _match_contact_name(contacts, wa_id)
+    folder = _ensure_drive_folder_for_contact(wa_id, contact_name)
+    if not folder:
+        return
+    uploaded = drive_client.upload_bytes(folder["id"], filename, mime_type, data)
+    if uploaded:
+        ack = (
+            "Saved your file to your secure Varush project vault. "
+            "Feel free to keep sharing anything else that helps us design."
+        )
+        await _send_whatsapp_text(wa_id, ack, preview_url=False)
 
 
 async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incoming_text: str) -> None:
@@ -582,14 +628,24 @@ def _store_lead_index(details: Dict[str, Any]) -> None:
     if len(key) > 10:
         key = key[-10:]
     index = _load_lead_index()
-    index[key] = {
-        "leadgen_id": details.get("leadgen_id"),
-        "canonical": canonical,
-        "source": "meta_lead",
-        "created_time": details.get("created_time"),
-        "ad_name": details.get("ad_name"),
-        "form_id": details.get("form_id"),
-    }
+    entry = index.get(key, {"canonical": {}})
+    entry.update(
+        {
+            "leadgen_id": details.get("leadgen_id"),
+            "canonical": canonical,
+            "source": "meta_lead",
+            "created_time": details.get("created_time"),
+            "ad_name": details.get("ad_name"),
+            "form_id": details.get("form_id"),
+        }
+    )
+    if not entry.get("drive_folder_id"):
+        display_name = canonical.get("full_name") or canonical.get("phone") or key
+        folder = drive_client.ensure_folder(f"Lead - {display_name}") if drive_client.ready() else None
+        if folder:
+            entry["drive_folder_id"] = folder["id"]
+            entry["drive_folder_link"] = DriveClient.folder_link(folder["id"])
+    index[key] = entry
     _save_lead_index(index)
 
 
@@ -645,6 +701,51 @@ def _normalize_phone(value: str | None) -> str | None:
         return None
     digits = "".join(ch for ch in value if ch.isdigit())
     return digits or None
+
+
+async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any]) -> tuple[bytes, str, str] | None:
+    if not WHATSAPP_ACCESS_TOKEN:
+        return None
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            meta_resp = await client.get(f"{GRAPH_API_BASE}/{media_id}", headers=headers)
+            meta_resp.raise_for_status()
+            meta = meta_resp.json()
+            url = meta.get("url")
+            mime_type = meta.get("mime_type") or media_info.get("mime_type") or "application/octet-stream"
+            download_resp = await client.get(url, headers=headers)
+            download_resp.raise_for_status()
+            data = download_resp.content
+    except httpx.HTTPError:
+        return None
+    filename = media_info.get("filename")
+    if not filename:
+        ext = mimetypes.guess_extension(mime_type) or ""
+        filename = f"{media_id}{ext}"
+    return data, mime_type, filename
+
+
+def _ensure_drive_folder_for_contact(wa_id: str, contact_name: str | None) -> Dict[str, str] | None:
+    if not drive_client.ready():
+        return None
+    key = _phone_key_from_wa(wa_id) or wa_id
+    index = _load_lead_index()
+    entry = index.get(key)
+    if entry and entry.get("drive_folder_id"):
+        return {"id": entry["drive_folder_id"], "link": entry.get("drive_folder_link", "")}
+    display_name = contact_name or f"Lead {wa_id[-4:]}"
+    folder = drive_client.ensure_folder(f"Lead - {display_name}")
+    if not folder:
+        return None
+    folder_link = DriveClient.folder_link(folder["id"])
+    if not entry:
+        entry = {"canonical": {}, "wa_id": wa_id}
+        index[key] = entry
+    entry["drive_folder_id"] = folder["id"]
+    entry["drive_folder_link"] = folder_link
+    _save_lead_index(index)
+    return {"id": folder["id"], "link": folder_link}
 
 
 def _load_lead_scores() -> Dict[str, Any]:
