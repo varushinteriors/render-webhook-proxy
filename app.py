@@ -24,6 +24,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 LEAD_ACCESS_TOKEN = os.getenv("LEAD_ACCESS_TOKEN", "") or WHATSAPP_ACCESS_TOKEN
+ADMIN_ALERT_NUMBERS = [n.strip() for n in os.getenv("ADMIN_ALERT_NUMBERS", "").split(",") if n.strip()]
 STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
@@ -336,6 +337,7 @@ async def _process_leadgen_payload(payload: Dict[str, Any]) -> None:
             details = await _fetch_lead_details(lead_id)
             if details:
                 _append_lead_details(details)
+                await _notify_admins_of_lead(details)
 
 
 async def _fetch_lead_details(lead_id: str) -> Dict[str, Any] | None:
@@ -355,6 +357,48 @@ async def _fetch_lead_details(lead_id: str) -> Dict[str, Any] | None:
         _append_lead_details({"leadgen_id": lead_id, "error": resp.text})
         return None
     return resp.json()
+
+
+async def _notify_admins_of_lead(details: Dict[str, Any]) -> None:
+    if not ADMIN_ALERT_NUMBERS:
+        return
+    summary = _format_lead_summary(details)
+    for number in ADMIN_ALERT_NUMBERS:
+        try:
+            await _send_whatsapp_text(number, summary, preview_url=False)
+        except HTTPException:
+            continue
+
+
+def _format_lead_summary(details: Dict[str, Any]) -> str:
+    created = _format_timestamp(details.get("created_time"))
+    ad_name = details.get("ad_name") or "Unknown Ad"
+    form_id = details.get("form_id") or "Unknown Form"
+    field_lines: List[str] = []
+    field_data = details.get("field_data", []) or []
+    for item in field_data:
+        name = item.get("name") or "Field"
+        values = item.get("values") or []
+        value = values[0] if values else ""
+        field_lines.append(f"{name}: {value}")
+    field_text = "\n".join(field_lines) if field_lines else "No form answers received."
+    return (
+        f"New Meta lead captured (Form {form_id}).\n"
+        f"Ad: {ad_name}\n"
+        f"Received: {created}\n"
+        f"Lead ID: {details.get('leadgen_id')}\n\n"
+        f"{field_text}"
+    )
+
+
+def _format_timestamp(ts: str | None) -> str:
+    if not ts:
+        return "Unknown time"
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+        return dt.astimezone(IST).strftime("%d %b %Y · %I:%M %p IST")
+    except ValueError:
+        return ts
 
 
 async def _send_whatsapp_text(to: str, message: str, preview_url: bool) -> Dict[str, Any]:
