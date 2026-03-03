@@ -22,11 +22,19 @@ META_VERIFY_TOKEN=testtoken FORWARD_URL=https://varush-webhook.onrender.com uvic
    - Optional: `LOG_PATH=/data/webhook-events.log` (persistent disk)
    - Optional: `ADMIN_TOKEN` (required for the admin endpoints)
    - Optional: `WHATSAPP_PHONE_ID`, `WHATSAPP_ACCESS_TOKEN` (needed to send replies via the Cloud API)
+   - Optional: `STATE_PATH` (defaults to `logs/conversations.json`) and `MEETING_LINK` for the auto-reply assistant
 3. (Optional) Attach a persistent disk (1 GB) to `/data` for log retention.
 4. Deploy. Once live, you'll get a URL like `https://varush-webhook-proxy.onrender.com/webhook`.
 
 ## Switching WhatsApp Webhook
 After deployment, update WhatsApp Business Manager webhook to the new URL and verify using the same `META_VERIFY_TOKEN`. Test inbound messages; the service will log them and forward to the legacy endpoint.
+
+## Assistant Auto-Reply Flow
+
+When `WHATSAPP_*` credentials are present, the webhook automatically:
+1. Logs every inbound message.
+2. Stores per-contact conversation state in `STATE_PATH` (default `logs/conversations.json`).
+3. Sends guided replies that collect project details (service type, location, project type, area, timeline, finish, budget, assets, portfolio preference) and then offers meeting slots generated in IST. The meeting link defaults to `https://meet.varushinteriors.com/intro` but can be overridden via `MEETING_LINK`.
 
 ## Admin Endpoints
 

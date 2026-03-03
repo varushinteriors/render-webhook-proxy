@@ -1,8 +1,10 @@
 import json
 import os
 from collections import deque
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException, Query, Header
@@ -17,6 +19,36 @@ LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
+STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
+IST = ZoneInfo("Asia/Kolkata")
+
+QUESTION_FLOW = [
+    "name",
+    "service_type",
+    "location",
+    "project_type",
+    "area",
+    "timeline",
+    "finish",
+    "budget",
+    "assets",
+    "portfolio",
+]
+
+QUESTION_PROMPTS = {
+    "name": "Hi there! 👋 I’m Kavya from Varush Architect & Interiors. May I have your name?",
+    "service_type": "Thanks {name}! What type of service are you looking for—interior design, architectural services, turnkey, or something else?",
+    "location": "Got it. Where is the project located? (Delhi, Gurugram, Faridabad, Noida, or another city—please mention.)",
+    "project_type": "What type of project is it (e.g., 2/3/4 BHK flat, villa, farmhouse, independent house, office space, etc.)?",
+    "area": "Approximately how many square feet is the space?",
+    "timeline": "When are you planning to start? (Immediately, within 3 months, within 6 months?)",
+    "finish": "What finish level would you like—budget-friendly, premium, or luxury?",
+    "budget": "What budget bracket should we plan for? (<10 lacs, 10–20 lacs, 20–30 lacs, >30 lacs, or flexible as per design.)",
+    "assets": "Do you have any layouts or site photos you can share here?",
+    "portfolio": "Would you like me to send over our latest work portfolio?",
+}
 
 
 @app.get("/webhook")
@@ -41,6 +73,7 @@ async def handle_webhook(request: Request):
     payload = await request.json()
     _append_log(payload)
     await _forward(payload)
+    await _auto_reply(payload)
     return {"status": "ok"}
 
 
@@ -70,6 +103,147 @@ async def admin_send_message(
     _require_admin_token(token or header_token)
     result = await _send_whatsapp_text(body.to, body.message, body.preview_url)
     return result
+
+
+async def _auto_reply(payload: Dict[str, Any]) -> None:
+    entries = payload.get("entry", [])
+    for entry in entries:
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            messages = value.get("messages")
+            if not messages:
+                continue
+            metadata = value.get("metadata", {})
+            business_phone_id = metadata.get("phone_number_id")
+            contacts = value.get("contacts", [])
+            for message in messages:
+                # Skip non-text or messages originating from our own number
+                if message.get("type") != "text":
+                    continue
+                wa_id = message.get("from")
+                if not wa_id or wa_id == business_phone_id:
+                    continue
+                text_body = message.get("text", {}).get("body", "").strip()
+                contact_name = _match_contact_name(contacts, wa_id)
+                await _handle_conversation_turn(wa_id, contact_name, text_body)
+
+
+def _match_contact_name(contacts: List[Dict[str, Any]], wa_id: str) -> str | None:
+    for contact in contacts:
+        if contact.get("wa_id") == wa_id:
+            profile = contact.get("profile", {})
+            return profile.get("name")
+    return None
+
+
+async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incoming_text: str) -> None:
+    state = _load_state()
+    convo = state.get(wa_id, {
+        "answers": {},
+        "current_index": 0,
+        "awaiting_field": None,
+        "completed": False,
+    })
+
+    # Record the contact name if we have it and haven't saved one yet
+    if contact_name and "contact_name" not in convo:
+        convo["contact_name"] = contact_name
+
+    # Save answer for the question we were waiting on
+    awaiting_field = convo.get("awaiting_field")
+    if awaiting_field:
+        convo.setdefault("answers", {})[awaiting_field] = incoming_text
+        if awaiting_field == "name" and not convo.get("contact_name"):
+            convo["contact_name"] = incoming_text
+        convo["awaiting_field"] = None
+
+    if convo.get("completed"):
+        # Send a polite acknowledgement but avoid restarting the flow
+        ack = _build_followup_ack(convo)
+        await _send_whatsapp_text(wa_id, ack, preview_url=False)
+        state[wa_id] = convo
+        _save_state(state)
+        return
+
+    if convo.get("current_index", 0) >= len(QUESTION_FLOW):
+        await _send_meeting_prompt(wa_id, convo)
+        convo["completed"] = True
+        state[wa_id] = convo
+        _save_state(state)
+        return
+
+    # Ask the next question
+    field = QUESTION_FLOW[convo.get("current_index", 0)]
+    prompt = _build_question_prompt(field, convo)
+    convo["awaiting_field"] = field
+    convo["current_index"] = convo.get("current_index", 0) + 1
+    await _send_whatsapp_text(wa_id, prompt, preview_url=False)
+    state[wa_id] = convo
+    _save_state(state)
+
+
+def _build_question_prompt(field: str, convo: Dict[str, Any]) -> str:
+    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+    template = QUESTION_PROMPTS.get(field, "Could you share more details?")
+    return template.format(name=name)
+
+
+def _build_followup_ack(convo: Dict[str, Any]) -> str:
+    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+    return (
+        f"Thanks for the update, {name}. I’ve logged your details and will share them with our lead designer. "
+        "If you’d like to tweak anything or book another slot, just let me know."
+    )
+
+
+async def _send_meeting_prompt(wa_id: str, convo: Dict[str, Any]) -> None:
+    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+    slots = _generate_meeting_slots()
+    slot_lines = [f"{i+1}. {slot}" for i, slot in enumerate(slots)]
+    slot_text = "\n".join(slot_lines)
+    message = (
+        f"Thanks, {name}! I have all the essentials. Let’s schedule a complimentary 10-min session with our designer.\n"
+        f"Here are the next available slots:\n{slot_text}\n\n"
+        f"Reply with the slot number that works best, and I’ll confirm it plus share the meeting link: {MEETING_LINK}"
+    )
+    await _send_whatsapp_text(wa_id, message, preview_url=True)
+
+
+def _generate_meeting_slots() -> List[str]:
+    now = datetime.now(IST)
+    slot_hours = [time(11, 0), time(15, 0), time(19, 0)]
+    slots: List[str] = []
+    day_offset = 0
+    while len(slots) < 3 and day_offset < 5:
+        day = (now + timedelta(days=day_offset)).date()
+        for slot_time in slot_hours:
+            slot_dt = datetime.combine(day, slot_time, tzinfo=IST)
+            if slot_dt <= now:
+                continue
+            slots.append(slot_dt.strftime("%a, %d %b · %I:%M %p IST"))
+            if len(slots) >= 3:
+                break
+        day_offset += 1
+    if not slots:
+        slots.append("Please suggest a time that suits you.")
+    return slots
+
+
+def _load_state() -> Dict[str, Any]:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        with STATE_PATH.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _save_state(state: Dict[str, Any]) -> None:
+    tmp_path = STATE_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+    tmp_path.replace(STATE_PATH)
 
 
 def _append_log(payload: Dict[str, Any]) -> None:
