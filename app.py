@@ -36,7 +36,10 @@ LEAD_SCORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
-LEAD_ACCESS_TOKEN = os.getenv("LEAD_ACCESS_TOKEN", "") or WHATSAPP_ACCESS_TOKEN
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "").strip()
+LEAD_ACCESS_TOKEN = os.getenv("LEAD_ACCESS_TOKEN", "").strip()
+if not LEAD_ACCESS_TOKEN:
+    LEAD_ACCESS_TOKEN = PAGE_ACCESS_TOKEN or WHATSAPP_ACCESS_TOKEN
 ADMIN_ALERT_NUMBERS = [n.strip() for n in os.getenv("ADMIN_ALERT_NUMBERS", "").split(",") if n.strip()]
 STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
