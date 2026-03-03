@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import httpx
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response, HTTPException, Query
 
 app = FastAPI()
 
@@ -16,10 +16,16 @@ LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 @app.get("/webhook")
 async def verify(
-    mode: str | None = None,
-    hub_challenge: str | None = None,
-    hub_verify_token: str | None = None,
+    mode: str | None = Query(default=None, alias="hub.mode"),
+    hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
+    hub_verify_token: str | None = Query(default=None, alias="hub.verify_token"),
+    plain_mode: str | None = None,
+    plain_challenge: str | None = None,
+    plain_verify_token: str | None = None,
 ):
+    mode = mode or plain_mode
+    hub_challenge = hub_challenge or plain_challenge
+    hub_verify_token = hub_verify_token or plain_verify_token
     if mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         return Response(content=hub_challenge or "", media_type="text/plain")
     raise HTTPException(status_code=403, detail="Invalid verify token")
