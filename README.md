@@ -17,7 +17,8 @@ META_VERIFY_TOKEN=testtoken FORWARD_URL=https://varush-webhook.onrender.com uvic
 ## Deploy to Render
 1. Create a new **Web Service** (Docker) and point it to this repo.
 2. Set environment variables:
-   - `META_VERIFY_TOKEN` (must match the token configured in WhatsApp Business Manager)
+   - `META_VERIFY_TOKEN` (must match the token configured in WhatsApp Business Manager; you can provide multiple tokens separated by commas)
+   - Optional: `PAGE_VERIFY_TOKEN` (use a different verify token for `page/leadgen` subscriptions if desired)
    - `FORWARD_URL` (e.g., `https://varush-webhook.onrender.com`)
    - Optional: `LOG_PATH=/data/webhook-events.log` (persistent disk)
    - Optional: `ADMIN_TOKEN` (required for the admin endpoints)

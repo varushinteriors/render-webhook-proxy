@@ -14,7 +14,14 @@ from agents.lead_scoring import LeadInput, LeadScoringAgent
 
 app = FastAPI()
 
-VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
+VERIFY_TOKEN_VALUES = {
+    token.strip()
+    for token in os.getenv("META_VERIFY_TOKEN", "").split(",")
+    if token.strip()
+}
+PAGE_VERIFY_TOKEN = os.getenv("PAGE_VERIFY_TOKEN", "").strip()
+if PAGE_VERIFY_TOKEN:
+    VERIFY_TOKEN_VALUES.add(PAGE_VERIFY_TOKEN)
 FORWARD_URL = os.getenv("FORWARD_URL", "https://varush-webhook.onrender.com")
 LOG_PATH = Path(os.getenv("LOG_PATH", "logs/webhook-events.log"))
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -112,7 +119,7 @@ async def verify(
     mode = mode or plain_mode
     hub_challenge = hub_challenge or plain_challenge
     hub_verify_token = hub_verify_token or plain_verify_token
-    if mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+    if mode == "subscribe" and _is_valid_verify_token(hub_verify_token):
         return Response(content=hub_challenge or "", media_type="text/plain")
     raise HTTPException(status_code=403, detail="Invalid verify token")
 
@@ -515,6 +522,14 @@ def _record_lead_score(key: str, result: Dict[str, Any]) -> None:
 def _append_log(payload: Dict[str, Any]) -> None:
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload) + "\n")
+
+
+def _is_valid_verify_token(token: str | None) -> bool:
+    if not token:
+        return False
+    if not VERIFY_TOKEN_VALUES:
+        return False
+    return token in VERIFY_TOKEN_VALUES
 
 
 def _append_lead_log(payload: Dict[str, Any]) -> None:
