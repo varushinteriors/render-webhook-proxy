@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: varush-webhook-proxy
+    env: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: FORWARD_URL
+        sync: false
+      - key: LOG_PATH
+        value: /data/webhook-events.log
+    disk:
+      name: proxy-data
+      mountPath: /data
+      sizeGB: 1
