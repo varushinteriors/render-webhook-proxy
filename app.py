@@ -1,7 +1,8 @@
+import asyncio
 import json
 import os
 from collections import deque
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
@@ -13,6 +14,11 @@ from pydantic import BaseModel
 from agents.lead_scoring import LeadInput, LeadScoringAgent
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    asyncio.create_task(_inactivity_watcher())
 
 VERIFY_TOKEN_VALUES = {
     token.strip()
@@ -72,6 +78,17 @@ QUESTION_PROMPTS = {
     "assets": "Do you have any layouts or site photos you can share here?",
     "portfolio": "Would you like me to send over our latest work portfolio?",
 }
+
+INACTIVITY_INITIAL_DELAY = 180  # seconds (3 minutes)
+INACTIVITY_INTERVAL = 60  # seconds between nudges
+INACTIVITY_MESSAGES = [
+    "Just checking in 😊 If you have a minute now, I can jot down the next detail and keep things moving for your space.",
+    "I don’t want you to lose the momentum—you’ll be amazed how quickly we can map ideas once we have these basics. Shall we pick up where we left off?",
+    "Still here whenever you need me! Even one quick line helps us tailor the perfect plan for your home.",
+]
+INACTIVITY_SOFT_CLOSE = (
+    "All good—I’ll pause for now. Drop me a message whenever you’re free and we’ll resume right away. Your dream space isn’t going anywhere. ✨"
+)
 
 CANONICAL_LEAD_FIELDS = [
     "full_name",
@@ -226,6 +243,13 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         "has_welcomed": False,
     })
 
+    now_ts = datetime.now(timezone.utc).timestamp()
+    convo["last_client_ts"] = now_ts
+    convo["inactivity_reminders_sent"] = 0
+    convo["next_inactivity_ts"] = None
+    convo["inactivity_paused"] = False
+    convo["inactivity_soft_closed"] = False
+
     # Record the contact name if we have it and haven't saved one yet
     if contact_name and "contact_name" not in convo:
         convo["contact_name"] = contact_name
@@ -366,6 +390,61 @@ async def _send_meeting_prompt(wa_id: str, convo: Dict[str, Any]) -> None:
         f"Reply with the slot number that works best, and I’ll confirm it plus share the meeting link: {MEETING_LINK}"
     )
     await _send_whatsapp_text(wa_id, message, preview_url=True)
+
+
+async def _inactivity_watcher() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await _process_inactivity_checks()
+        except Exception:
+            continue
+
+
+async def _process_inactivity_checks() -> None:
+    state = _load_state()
+    if not state:
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    updated = False
+    for wa_id, convo in state.items():
+        if convo.get("completed") or convo.get("inactivity_paused"):
+            continue
+        if not convo.get("has_welcomed"):
+            continue
+        last_ts = convo.get("last_client_ts")
+        if not last_ts:
+            continue
+        reminders_sent = convo.get("inactivity_reminders_sent", 0)
+        soft_closed = convo.get("inactivity_soft_closed", False)
+        next_ts = convo.get("next_inactivity_ts")
+
+        if reminders_sent >= len(INACTIVITY_MESSAGES):
+            if soft_closed:
+                continue
+            trigger = next_ts or (last_ts + INACTIVITY_INITIAL_DELAY + reminders_sent * INACTIVITY_INTERVAL)
+            if now < trigger:
+                continue
+            await _send_whatsapp_text(wa_id, INACTIVITY_SOFT_CLOSE, preview_url=False)
+            convo["inactivity_soft_closed"] = True
+            convo["inactivity_paused"] = True
+            convo["next_inactivity_ts"] = None
+            updated = True
+            continue
+
+        trigger = next_ts or (last_ts + INACTIVITY_INITIAL_DELAY)
+        if reminders_sent > 0 and not next_ts:
+            trigger = last_ts + INACTIVITY_INITIAL_DELAY + reminders_sent * INACTIVITY_INTERVAL
+        if now < trigger:
+            continue
+        message = INACTIVITY_MESSAGES[reminders_sent]
+        await _send_whatsapp_text(wa_id, message, preview_url=False)
+        reminders_sent += 1
+        convo["inactivity_reminders_sent"] = reminders_sent
+        convo["next_inactivity_ts"] = now + INACTIVITY_INTERVAL
+        updated = True
+    if updated:
+        _save_state(state)
 
 
 def _generate_meeting_slots() -> List[str]:
