@@ -24,7 +24,7 @@ META_VERIFY_TOKEN=testtoken FORWARD_URL=https://varush-webhook.onrender.com uvic
    - Optional: `ADMIN_TOKEN` (required for the admin endpoints)
    - Optional: `WHATSAPP_PHONE_ID`, `WHATSAPP_ACCESS_TOKEN` (needed to send replies via the Cloud API)
    - Optional: `STATE_PATH` (defaults to `logs/conversations.json`) and `MEETING_LINK` for the auto-reply assistant
-   - Optional: `LEAD_ACCESS_TOKEN`, `PAGE_ACCESS_TOKEN`, `LEAD_LOG_PATH`, `LEAD_DETAILS_PATH` if you enable Meta Lead Ads ingestion (if `LEAD_ACCESS_TOKEN` is omitted, `PAGE_ACCESS_TOKEN` or the WhatsApp token will be used)
+   - Optional: `PAGE_ACCESS_TOKEN`, `LEAD_ACCESS_TOKEN`, `LEAD_LOG_PATH`, `LEAD_DETAILS_PATH` if you enable Meta Lead Ads ingestion (the service uses `PAGE_ACCESS_TOKEN` first, then `LEAD_ACCESS_TOKEN`, then falls back to the WhatsApp token)
    - Optional: `LEAD_INDEX_PATH` (defaults to `logs/lead-index.json`) to store phone → lead-field mappings
    - Optional: `LEAD_SCORE_PATH` (defaults to `logs/lead-scores.json`) to persist cold/warm/hot ratings
    - Optional: `ADMIN_ALERT_NUMBERS` (comma-separated WhatsApp numbers to receive lead notifications)
