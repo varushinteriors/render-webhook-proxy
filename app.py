@@ -722,7 +722,11 @@ async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any]) ->
     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            meta_resp = await client.get(f"{GRAPH_API_BASE}/{media_id}", headers=headers)
+            meta_resp = await client.get(
+                f"{GRAPH_API_BASE}/{media_id}",
+                headers=headers,
+                params={"messaging_product": "whatsapp"},
+            )
             meta_resp.raise_for_status()
             meta = meta_resp.json()
             url = meta.get("url")
