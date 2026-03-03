@@ -27,6 +27,7 @@ META_VERIFY_TOKEN=testtoken FORWARD_URL=https://varush-webhook.onrender.com uvic
    - Optional: `PAGE_ACCESS_TOKEN`, `LEAD_ACCESS_TOKEN`, `LEAD_LOG_PATH`, `LEAD_DETAILS_PATH` if you enable Meta Lead Ads ingestion (the service uses `PAGE_ACCESS_TOKEN` first, then `LEAD_ACCESS_TOKEN`, then falls back to the WhatsApp token)
    - Optional: `LEAD_INDEX_PATH` (defaults to `logs/lead-index.json`) to store phone → lead-field mappings
    - Optional: `LEAD_SCORE_PATH` (defaults to `logs/lead-scores.json`) to persist cold/warm/hot ratings
+   - Optional: `MEETINGS_PATH` (defaults to `logs/meetings.json`) to persist booked meetings for reminder scheduling
    - Optional: `ADMIN_ALERT_NUMBERS` (comma-separated WhatsApp numbers to receive lead notifications)
 3. (Optional) Attach a persistent disk (1 GB) to `/data` for log retention.
 4. Deploy. Once live, you'll get a URL like `https://varush-webhook-proxy.onrender.com/webhook`.
@@ -50,6 +51,19 @@ Subscribe your Meta app to `page` → `leadgen` events and point it to `https://
   - Warm if budget/timeline are viable but missing hot criteria.
   - Cold otherwise.
 - Scores + rationale are persisted to `LEAD_SCORE_PATH` for downstream CRM or prioritization.
+
+## Meeting Warm-up Agent
+
+- Meetings (stored in `MEETINGS_PATH`) receive reminders at T‑2h, T‑1h, and T‑10 min with on-brand hype copy.
+- After booking a meeting, register it via `POST /admin/schedule-meeting`:
+  ```json
+  {
+    "wa_id": "91987...",
+    "scheduled_at": "2026-03-05T15:00:00+05:30",
+    "note": "Intro call"
+  }
+  ```
+- Reminder scheduler runs every ~30 s and will mark meetings complete once the start time passes.
 
 ## Assistant Auto-Reply Flow
 
@@ -77,3 +91,11 @@ Headers: X-Admin-Token: <ADMIN_TOKEN>
 Body: { "to": "<wa_id>", "message": "text", "preview_url": false }
 ```
 Requires `WHATSAPP_PHONE_ID` and `WHATSAPP_ACCESS_TOKEN` to be set. The endpoint relays the request to `https://graph.facebook.com/v20.0/{PHONE_ID}/messages`.
+
+### Register a meeting (for warm-up reminders)
+```
+POST /admin/schedule-meeting
+Headers: X-Admin-Token: <ADMIN_TOKEN>
+Body: { "wa_id": "<contact wa_id>", "scheduled_at": "2026-03-05T15:00:00+05:30", "note": "optional" }
+```
+The service stores the meeting in `MEETINGS_PATH` and automatically sends reminders at 2 h, 1 h, and 10 min before start, then marks it complete.

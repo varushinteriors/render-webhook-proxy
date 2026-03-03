@@ -19,6 +19,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup_event() -> None:
     asyncio.create_task(_inactivity_watcher())
+    asyncio.create_task(_meeting_reminder_watcher())
 
 VERIFY_TOKEN_VALUES = {
     token.strip()
@@ -39,6 +40,8 @@ LEAD_INDEX_PATH = Path(os.getenv("LEAD_INDEX_PATH", "logs/lead-index.json"))
 LEAD_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
 LEAD_SCORE_PATH = Path(os.getenv("LEAD_SCORE_PATH", "logs/lead-scores.json"))
 LEAD_SCORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+MEETINGS_PATH = Path(os.getenv("MEETINGS_PATH", "logs/meetings.json"))
+MEETINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
@@ -89,6 +92,17 @@ INACTIVITY_MESSAGES = [
 INACTIVITY_SOFT_CLOSE = (
     "All good—I’ll pause for now. Drop me a message whenever you’re free and we’ll resume right away. Your dream space isn’t going anywhere. ✨"
 )
+
+MEETING_REMINDER_WINDOWS = [
+    (7200, "two_hours"),
+    (3600, "one_hour"),
+    (600, "ten_minutes"),
+]
+MEETING_REMINDER_MESSAGES = {
+    "two_hours": "Hi {name}! We’re just 2 hours away from reimagining your space together. Get ready for a design huddle that’ll spark new ideas and show how intricate (and fun) the process can be.",
+    "one_hour": "One hour to go! This session is where we unpack the latest finishes, trend insights, and the smart moves that set premium homes apart. Expect your mindset to shift in the best way.",
+    "ten_minutes": "Final countdown—10 minutes! Keep your excitement up because we’re about to dive into the details that turn good spaces into unforgettable ones. Join via {link} and let’s create something special.",
+}
 
 CANONICAL_LEAD_FIELDS = [
     "full_name",
@@ -181,6 +195,12 @@ class SendMessageRequest(BaseModel):
     preview_url: bool = False
 
 
+class ScheduleMeetingRequest(BaseModel):
+    wa_id: str
+    scheduled_at: str  # ISO 8601 string
+    note: str | None = None
+
+
 @app.get("/events/latest")
 async def latest_events(
     limit: int = Query(default=20, ge=1, le=200),
@@ -201,6 +221,17 @@ async def admin_send_message(
     _require_admin_token(token or header_token)
     result = await _send_whatsapp_text(body.to, body.message, body.preview_url)
     return result
+
+
+@app.post("/admin/schedule-meeting")
+async def admin_schedule_meeting(
+    body: ScheduleMeetingRequest,
+    token: str | None = Query(default=None),
+    header_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    _require_admin_token(token or header_token)
+    meeting = _register_meeting(body)
+    return meeting
 
 
 async def _auto_reply(payload: Dict[str, Any]) -> None:
@@ -401,6 +432,15 @@ async def _inactivity_watcher() -> None:
             continue
 
 
+async def _meeting_reminder_watcher() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await _process_meeting_reminders()
+        except Exception:
+            continue
+
+
 async def _process_inactivity_checks() -> None:
     state = _load_state()
     if not state:
@@ -445,6 +485,38 @@ async def _process_inactivity_checks() -> None:
         updated = True
     if updated:
         _save_state(state)
+
+
+async def _process_meeting_reminders() -> None:
+    meetings = _load_meetings()
+    if not meetings:
+        return
+    now = datetime.now(timezone.utc)
+    state = _load_state()
+    updated = False
+    for meeting in meetings:
+        if meeting.get("status") != "scheduled":
+            continue
+        scheduled_at = _parse_meeting_time(meeting.get("scheduled_at"))
+        if not scheduled_at:
+            continue
+        seconds_until = (scheduled_at - now).total_seconds()
+        if seconds_until <= -300:
+            meeting["status"] = "completed"
+            updated = True
+            continue
+        sent = set(meeting.get("reminders_sent", []))
+        for threshold, label in MEETING_REMINDER_WINDOWS:
+            if label in sent:
+                continue
+            if seconds_until <= threshold:
+                message = _build_meeting_message(label, meeting, state)
+                await _send_whatsapp_text(meeting.get("wa_id"), message, preview_url=False)
+                meeting.setdefault("reminders_sent", []).append(label)
+                updated = True
+                break
+    if updated:
+        _save_meetings(meetings)
 
 
 def _generate_meeting_slots() -> List[str]:
@@ -586,6 +658,73 @@ def _load_lead_scores() -> Dict[str, Any]:
 
 
 def _save_lead_scores(data: Dict[str, Any]) -> None:
+    tmp_path = LEAD_SCORE_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    tmp_path.replace(LEAD_SCORE_PATH)
+
+
+def _record_lead_score(key: str, result: Dict[str, Any]) -> None:
+    if not key:
+        return
+    scores = _load_lead_scores()
+    scores[key] = result
+    _save_lead_scores(scores)
+
+
+def _load_meetings() -> List[Dict[str, Any]]:
+    if not MEETINGS_PATH.exists():
+        return []
+    try:
+        with MEETINGS_PATH.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError:
+        return []
+
+
+def _save_meetings(meetings: List[Dict[str, Any]]) -> None:
+    tmp_path = MEETINGS_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(meetings, fh)
+    tmp_path.replace(MEETINGS_PATH)
+
+
+def _register_meeting(body: ScheduleMeetingRequest) -> Dict[str, Any]:
+    meeting_time = _parse_meeting_time(body.scheduled_at)
+    if not meeting_time:
+        raise HTTPException(status_code=400, detail="Invalid scheduled_at format")
+    meetings = _load_meetings()
+    record = {
+        "wa_id": body.wa_id,
+        "scheduled_at": meeting_time.astimezone(timezone.utc).isoformat(),
+        "note": body.note,
+        "status": "scheduled",
+        "reminders_sent": [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    meetings.append(record)
+    _save_meetings(meetings)
+    return record
+
+
+def _parse_meeting_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST)
+    return dt.astimezone(timezone.utc)
+
+
+def _build_meeting_message(label: str, meeting: Dict[str, Any], state: Dict[str, Any]) -> str:
+    template = MEETING_REMINDER_MESSAGES.get(label, "")
+    wa_id = meeting.get("wa_id", "")
+    convo = state.get(wa_id, {})
+    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+    return template.format(name=name, link=MEETING_LINK)
     tmp_path = LEAD_SCORE_PATH.with_suffix(".tmp")
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(data, fh)
