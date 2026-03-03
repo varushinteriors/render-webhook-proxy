@@ -10,6 +10,8 @@ import httpx
 from fastapi import FastAPI, Request, Response, HTTPException, Query, Header
 from pydantic import BaseModel
 
+from agents.lead_scoring import LeadInput, LeadScoringAgent
+
 app = FastAPI()
 
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
@@ -22,6 +24,8 @@ LEAD_DETAILS_PATH = Path(os.getenv("LEAD_DETAILS_PATH", "logs/leadgen-details.lo
 LEAD_DETAILS_PATH.parent.mkdir(parents=True, exist_ok=True)
 LEAD_INDEX_PATH = Path(os.getenv("LEAD_INDEX_PATH", "logs/lead-index.json"))
 LEAD_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+LEAD_SCORE_PATH = Path(os.getenv("LEAD_SCORE_PATH", "logs/lead-scores.json"))
+LEAD_SCORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
@@ -31,6 +35,8 @@ STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
 IST = ZoneInfo("Asia/Kolkata")
+
+scoring_agent = LeadScoringAgent()
 
 QUESTION_FLOW = [
     "name",
@@ -231,6 +237,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         await _send_whatsapp_text(wa_id, ack, preview_url=False)
         state[wa_id] = convo
         _save_state(state)
+        _score_lead_from_conversation(wa_id, convo)
         return
 
     next_field = _next_missing_field(convo)
@@ -244,6 +251,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         convo["completed"] = True
         state[wa_id] = convo
         _save_state(state)
+        _score_lead_from_conversation(wa_id, convo)
         return
 
     prompt = _build_question_prompt(next_field, convo)
@@ -259,6 +267,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     await _send_whatsapp_text(wa_id, message, preview_url=False)
     state[wa_id] = convo
     _save_state(state)
+    _score_lead_from_conversation(wa_id, convo)
 
 
 def _build_question_prompt(field: str, convo: Dict[str, Any]) -> str:
@@ -424,11 +433,83 @@ def _store_lead_index(details: Dict[str, Any]) -> None:
     _save_lead_index(index)
 
 
+def _score_lead_from_canonical(details: Dict[str, Any]) -> None:
+    canonical = details.get("canonical") or {}
+    phone = canonical.get("phone")
+    key = _normalize_phone(phone)
+    if key and len(key) > 10:
+        key = key[-10:]
+    lead_input = LeadInput(
+        timeline=canonical.get("timeline"),
+        budget=canonical.get("budget_bracket"),
+        property_type=canonical.get("project_type"),
+        service_type=canonical.get("service_type"),
+        assets_shared=False,
+        answered_fields=0,
+        total_fields=len(QUESTION_FLOW),
+    )
+    result = scoring_agent.score(lead_input)
+    result.update({"source": "canonical", "leadgen_id": details.get("leadgen_id")})
+    if key:
+        _record_lead_score(key, result)
+
+
+def _score_lead_from_conversation(wa_id: str, convo: Dict[str, Any]) -> None:
+    key = _phone_key_from_wa(wa_id)
+    index = _load_lead_index()
+    canonical = index.get(key, {}).get("canonical", {}) if key else {}
+    answers = convo.get("answers", {})
+    timeline = answers.get("timeline") or canonical.get("timeline")
+    budget = answers.get("budget") or canonical.get("budget_bracket")
+    property_type = answers.get("project_type") or canonical.get("project_type")
+    service_type = answers.get("service_type") or canonical.get("service_type")
+    assets_shared = bool(answers.get("assets"))
+    answered_fields = sum(1 for field in QUESTION_FLOW if answers.get(field))
+    total_fields = len(QUESTION_FLOW)
+    lead_input = LeadInput(
+        timeline=timeline,
+        budget=budget,
+        property_type=property_type,
+        service_type=service_type,
+        assets_shared=assets_shared,
+        answered_fields=answered_fields,
+        total_fields=total_fields,
+    )
+    result = scoring_agent.score(lead_input)
+    result.update({"source": "conversation", "wa_id": wa_id})
+    _record_lead_score(key or wa_id, result)
+
+
 def _normalize_phone(value: str | None) -> str | None:
     if not value:
         return None
     digits = "".join(ch for ch in value if ch.isdigit())
     return digits or None
+
+
+def _load_lead_scores() -> Dict[str, Any]:
+    if not LEAD_SCORE_PATH.exists():
+        return {}
+    try:
+        with LEAD_SCORE_PATH.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _save_lead_scores(data: Dict[str, Any]) -> None:
+    tmp_path = LEAD_SCORE_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    tmp_path.replace(LEAD_SCORE_PATH)
+
+
+def _record_lead_score(key: str, result: Dict[str, Any]) -> None:
+    if not key:
+        return
+    scores = _load_lead_scores()
+    scores[key] = result
+    _save_lead_scores(scores)
 
 
 def _append_log(payload: Dict[str, Any]) -> None:
@@ -519,6 +600,7 @@ async def _process_leadgen_payload(payload: Dict[str, Any]) -> None:
             if details:
                 _append_lead_details(details)
                 _store_lead_index(details)
+                _score_lead_from_canonical(details)
                 await _notify_admins_of_lead(details)
 
 

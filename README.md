@@ -25,6 +25,7 @@ META_VERIFY_TOKEN=testtoken FORWARD_URL=https://varush-webhook.onrender.com uvic
    - Optional: `STATE_PATH` (defaults to `logs/conversations.json`) and `MEETING_LINK` for the auto-reply assistant
    - Optional: `LEAD_ACCESS_TOKEN`, `LEAD_LOG_PATH`, `LEAD_DETAILS_PATH` if you enable Meta Lead Ads ingestion
    - Optional: `LEAD_INDEX_PATH` (defaults to `logs/lead-index.json`) to store phone → lead-field mappings
+   - Optional: `LEAD_SCORE_PATH` (defaults to `logs/lead-scores.json`) to persist cold/warm/hot ratings
    - Optional: `ADMIN_ALERT_NUMBERS` (comma-separated WhatsApp numbers to receive lead notifications)
 3. (Optional) Attach a persistent disk (1 GB) to `/data` for log retention.
 4. Deploy. Once live, you'll get a URL like `https://varush-webhook-proxy.onrender.com/webhook`.
@@ -39,6 +40,15 @@ Subscribe your Meta app to `page` → `leadgen` events and point it to `https://
 2. Fetch the full lead record via Graph API `/{leadgen_id}?fields=field_data,...` using `LEAD_ACCESS_TOKEN` (falls back to `WHATSAPP_ACCESS_TOKEN` if unset).
 3. Append the detailed record to `LEAD_DETAILS_PATH` for processing.
 4. If `ADMIN_ALERT_NUMBERS` is set, WhatsApp a summary of each lead to those numbers via the built-in send-message helper.
+
+## Lead Scoring Agent
+
+- Implemented in `agents/lead_scoring.py` and instantiated by the FastAPI service.
+- Every Meta lead (canonical data) and every WhatsApp conversation update is scored as **hot**, **warm**, or **cold** using the rules:
+  - Hot if timeline ≤3 months with high/flexible budget or high-value property, or if the lead has shared layouts/photos and completed every intake answer.
+  - Warm if budget/timeline are viable but missing hot criteria.
+  - Cold otherwise.
+- Scores + rationale are persisted to `LEAD_SCORE_PATH` for downstream CRM or prioritization.
 
 ## Assistant Auto-Reply Flow
 
