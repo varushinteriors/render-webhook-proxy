@@ -10,20 +10,31 @@ from googleapiclient.http import MediaIoBaseUpload
 
 
 class DriveClient:
-    def __init__(self, credentials_path: Optional[str], parent_folder_id: Optional[str]):
+    def __init__(
+        self,
+        parent_folder_id: Optional[str],
+        credentials_path: Optional[str] = None,
+        credentials_info: Optional[dict] = None,
+    ):
         self.credentials_path = credentials_path
+        self.credentials_info = credentials_info
         self.parent_folder_id = parent_folder_id
         self._service = None
 
     def ready(self) -> bool:
-        return bool(self.credentials_path and self.parent_folder_id)
+        return bool(self.parent_folder_id and (self.credentials_path or self.credentials_info))
 
     def _service_client(self):
         if self._service is None:
             scopes = ["https://www.googleapis.com/auth/drive"]
-            creds = service_account.Credentials.from_service_account_file(
-                self.credentials_path, scopes=scopes
-            )
+            if self.credentials_info:
+                creds = service_account.Credentials.from_service_account_info(
+                    self.credentials_info, scopes=scopes
+                )
+            else:
+                creds = service_account.Credentials.from_service_account_file(
+                    self.credentials_path, scopes=scopes
+                )
             self._service = build("drive", "v3", credentials=creds)
         return self._service
 

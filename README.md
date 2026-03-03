@@ -28,6 +28,9 @@ META_VERIFY_TOKEN=testtoken FORWARD_URL=https://varush-webhook.onrender.com uvic
    - Optional: `LEAD_INDEX_PATH` (defaults to `logs/lead-index.json`) to store phone → lead-field mappings
    - Optional: `LEAD_SCORE_PATH` (defaults to `logs/lead-scores.json`) to persist cold/warm/hot ratings
    - Optional: `MEETINGS_PATH` (defaults to `logs/meetings.json`) to persist booked meetings for reminder scheduling
+   - Optional: `LEAD_ENGAGEMENT_PATH` (defaults to `logs/lead-engagement.json`) for future template drips
+   - Optional: `DRIVE_PARENT_FOLDER_ID` + (`GOOGLE_APPLICATION_CREDENTIALS` path or `GOOGLE_DRIVE_CREDENTIALS_JSON`) to enable Google Drive uploads (defaults prefilled for Varush)
+   - Optional: `DRIVE_PORTFOLIO_LINK` to control the portfolio link shared in-chat
    - Optional: `ADMIN_ALERT_NUMBERS` (comma-separated WhatsApp numbers to receive lead notifications)
 3. (Optional) Attach a persistent disk (1 GB) to `/data` for log retention.
 4. Deploy. Once live, you'll get a URL like `https://varush-webhook-proxy.onrender.com/webhook`.
@@ -64,6 +67,13 @@ Subscribe your Meta app to `page` → `leadgen` events and point it to `https://
   }
   ```
 - Reminder scheduler runs every ~30 s and will mark meetings complete once the start time passes.
+
+## Asset & Portfolio Agent
+
+- Uses the Google Drive service account at `GOOGLE_APPLICATION_CREDENTIALS` and `DRIVE_PARENT_FOLDER_ID` to auto-create `Lead - {Name}` folders.
+- Any inbound WhatsApp media (images, documents, video, etc.) is downloaded via Meta’s Graph API and uploaded to the lead’s Drive folder.
+- The agent acknowledges each upload in-chat so clients know their layouts/photos are saved securely.
+- The intake flow’s portfolio question now shares the curated portfolio link (`DRIVE_PORTFOLIO_LINK`) automatically.
 
 ## Assistant Auto-Reply Flow
 

@@ -69,9 +69,18 @@ MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro
 IST = ZoneInfo("Asia/Kolkata")
 
 scoring_agent = LeadScoringAgent()
+credentials_info = None
+credentials_json = os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
+if credentials_json:
+    try:
+        credentials_info = json.loads(credentials_json)
+    except json.JSONDecodeError:
+        credentials_info = None
+
 drive_client = DriveClient(
-    os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
     DRIVE_PARENT_FOLDER_ID,
+    credentials_path=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+    credentials_info=credentials_info,
 )
 
 QUESTION_FLOW = [
@@ -308,7 +317,11 @@ async def _handle_media_message(
             "Saved your file to your secure Varush project vault. "
             "Feel free to keep sharing anything else that helps us design."
         )
-        await _send_whatsapp_text(wa_id, ack, preview_url=False)
+    else:
+        ack = (
+            "Received your file—thank you! I’ll log it and keep things moving while our drive sync completes."
+        )
+    await _send_whatsapp_text(wa_id, ack, preview_url=False)
 
 
 async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incoming_text: str) -> None:
