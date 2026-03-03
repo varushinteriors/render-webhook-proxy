@@ -56,6 +56,30 @@ QUESTION_PROMPTS = {
     "portfolio": "Would you like me to send over our latest work portfolio?",
 }
 
+CANONICAL_LEAD_FIELDS = [
+    "full_name",
+    "phone",
+    "email",
+    "service_type",
+    "project_location",
+    "project_type",
+    "area_sqft",
+    "timeline",
+    "finish_level",
+    "budget_bracket",
+    "other_notes",
+]
+
+LEAD_FIELD_MAP = {
+    "name": "full_name",
+    "email": "email",
+    "phone": "phone",
+    "what is your property type?": "project_type",
+    "what is your budget for interior project?": "budget_bracket",
+    "how soon are you planning to get started?": "timeline",
+    "where is your property located?": "project_location",
+}
+
 
 @app.get("/webhook")
 async def verify(
@@ -290,6 +314,24 @@ def _append_lead_details(data: Dict[str, Any]) -> None:
         fh.write(json.dumps(data) + "\n")
 
 
+def _init_canonical_lead() -> Dict[str, Any]:
+    return {field: None for field in CANONICAL_LEAD_FIELDS}
+
+
+def _normalize_lead_fields(field_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    canonical = _init_canonical_lead()
+    for item in field_data or []:
+        name = (item.get("name") or "").strip()
+        key = LEAD_FIELD_MAP.get(name.lower())
+        if not key:
+            continue
+        values = item.get("values") or []
+        value = values[0] if values else None
+        if value:
+            canonical[key] = value
+    return canonical
+
+
 def _read_latest_events(limit: int) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     if not LOG_PATH.exists():
@@ -363,7 +405,9 @@ async def _fetch_lead_details(lead_id: str) -> Dict[str, Any] | None:
         # Log the failure for visibility
         _append_lead_details({"leadgen_id": lead_id, "error": resp.text})
         return None
-    return resp.json()
+    data = resp.json()
+    data["canonical"] = _normalize_lead_fields(data.get("field_data", []))
+    return data
 
 
 async def _notify_admins_of_lead(details: Dict[str, Any]) -> None:
@@ -381,20 +425,25 @@ def _format_lead_summary(details: Dict[str, Any]) -> str:
     created = _format_timestamp(details.get("created_time"))
     ad_name = details.get("ad_name") or "Unknown Ad"
     form_id = details.get("form_id") or "Unknown Form"
-    field_lines: List[str] = []
-    field_data = details.get("field_data", []) or []
-    for item in field_data:
-        name = item.get("name") or "Field"
-        values = item.get("values") or []
-        value = values[0] if values else ""
-        field_lines.append(f"{name}: {value}")
-    field_text = "\n".join(field_lines) if field_lines else "No form answers received."
+    canonical = details.get("canonical") or {}
+    highlights: List[str] = []
+    if canonical.get("full_name"):
+        highlights.append(f"Name: {canonical['full_name']}")
+    if canonical.get("project_location"):
+        highlights.append(f"Location: {canonical['project_location']}")
+    if canonical.get("project_type"):
+        highlights.append(f"Property: {canonical['project_type']}")
+    if canonical.get("budget_bracket"):
+        highlights.append(f"Budget: {canonical['budget_bracket']}")
+    if canonical.get("timeline"):
+        highlights.append(f"Timeline: {canonical['timeline']}")
+    highlight_text = "\n".join(highlights) if highlights else "(No structured details parsed yet.)"
     return (
         f"New Meta lead captured (Form {form_id}).\n"
         f"Ad: {ad_name}\n"
         f"Received: {created}\n"
         f"Lead ID: {details.get('leadgen_id')}\n\n"
-        f"{field_text}"
+        f"{highlight_text}"
     )
 
 
