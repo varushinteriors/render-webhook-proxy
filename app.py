@@ -20,6 +20,8 @@ LEAD_LOG_PATH = Path(os.getenv("LEAD_LOG_PATH", "logs/leadgen-events.log"))
 LEAD_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 LEAD_DETAILS_PATH = Path(os.getenv("LEAD_DETAILS_PATH", "logs/leadgen-details.log"))
 LEAD_DETAILS_PATH.parent.mkdir(parents=True, exist_ok=True)
+LEAD_INDEX_PATH = Path(os.getenv("LEAD_INDEX_PATH", "logs/lead-index.json"))
+LEAD_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
@@ -78,6 +80,17 @@ LEAD_FIELD_MAP = {
     "what is your budget for interior project?": "budget_bracket",
     "how soon are you planning to get started?": "timeline",
     "where is your property located?": "project_location",
+}
+
+CANONICAL_TO_STATE_FIELD = {
+    "full_name": "name",
+    "service_type": "service_type",
+    "project_location": "location",
+    "project_type": "project_type",
+    "area_sqft": "area",
+    "timeline": "timeline",
+    "finish_level": "finish",
+    "budget_bracket": "budget",
 }
 
 
@@ -193,9 +206,9 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     state = _load_state()
     convo = state.get(wa_id, {
         "answers": {},
-        "current_index": 0,
         "awaiting_field": None,
         "completed": False,
+        "has_welcomed": False,
     })
 
     # Record the contact name if we have it and haven't saved one yet
@@ -210,6 +223,8 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
             convo["contact_name"] = incoming_text
         convo["awaiting_field"] = None
 
+    _hydrate_state_from_lead(wa_id, convo)
+
     if convo.get("completed"):
         # Send a polite acknowledgement but avoid restarting the flow
         ack = _build_followup_ack(convo)
@@ -218,19 +233,30 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         _save_state(state)
         return
 
-    if convo.get("current_index", 0) >= len(QUESTION_FLOW):
+    next_field = _next_missing_field(convo)
+    if not next_field:
+        if not convo.get("has_welcomed"):
+            welcome = _build_welcome_message(convo)
+            if welcome:
+                await _send_whatsapp_text(wa_id, welcome, preview_url=False)
+            convo["has_welcomed"] = True
         await _send_meeting_prompt(wa_id, convo)
         convo["completed"] = True
         state[wa_id] = convo
         _save_state(state)
         return
 
-    # Ask the next question
-    field = QUESTION_FLOW[convo.get("current_index", 0)]
-    prompt = _build_question_prompt(field, convo)
-    convo["awaiting_field"] = field
-    convo["current_index"] = convo.get("current_index", 0) + 1
-    await _send_whatsapp_text(wa_id, prompt, preview_url=False)
+    prompt = _build_question_prompt(next_field, convo)
+    convo["awaiting_field"] = next_field
+
+    if not convo.get("has_welcomed"):
+        welcome = _build_welcome_message(convo)
+        message = f"{welcome}\n\n{prompt}" if welcome else prompt
+        convo["has_welcomed"] = True
+    else:
+        message = prompt
+
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
     state[wa_id] = convo
     _save_state(state)
 
@@ -247,6 +273,68 @@ def _build_followup_ack(convo: Dict[str, Any]) -> str:
         f"Thanks for the update, {name}. I’ve logged your details and will share them with our lead designer. "
         "If you’d like to tweak anything or book another slot, just let me know."
     )
+
+
+def _build_welcome_message(convo: Dict[str, Any]) -> str:
+    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+    answers = convo.get("answers", {})
+    snippets: List[str] = []
+    if answers.get("service_type"):
+        snippets.append(f"you're looking for {answers['service_type'].lower()} support")
+    if answers.get("project_type"):
+        snippets.append(f"for a {answers['project_type']}")
+    if answers.get("location"):
+        snippets.append(f"in {answers['location']}")
+    if answers.get("budget"):
+        snippets.append(f"with a budget around {answers['budget']}")
+    if answers.get("timeline"):
+        snippets.append(f"and a timeline of {answers['timeline']}")
+    known_text = ", ".join(snippets)
+    if known_text:
+        summary = f"I noted that {known_text}."
+    else:
+        summary = "I'll grab a few quick details so we can tailor everything perfectly."
+    return (
+        f"Hi {name}! 👋 Thanks for choosing Varush Architect & Interiors. {summary} "
+        "I’ll ask only what’s needed and skip anything you’ve already shared."
+    )
+
+
+def _next_missing_field(convo: Dict[str, Any]) -> str | None:
+    answers = convo.get("answers", {})
+    for field in QUESTION_FLOW:
+        value = answers.get(field)
+        if field == "name" and (convo.get("contact_name") or value):
+            continue
+        if not value:
+            return field
+    return None
+
+
+def _hydrate_state_from_lead(wa_id: str, convo: Dict[str, Any]) -> None:
+    if convo.get("lead_prefill_done"):
+        return
+    index = _load_lead_index()
+    key = _phone_key_from_wa(wa_id)
+    record = index.get(key)
+    if not record:
+        return
+    answers = convo.setdefault("answers", {})
+    canonical = record.get("canonical", {})
+    for canon_field, state_field in CANONICAL_TO_STATE_FIELD.items():
+        value = canonical.get(canon_field)
+        if value and not answers.get(state_field):
+            answers[state_field] = value
+            if state_field == "name" and not convo.get("contact_name"):
+                convo["contact_name"] = value
+    convo["lead_prefill_done"] = True
+
+
+def _phone_key_from_wa(wa_id: str) -> str | None:
+    key = _normalize_phone(wa_id)
+    if key and len(key) > 10:
+        return key[-10:]
+    return key
 
 
 async def _send_meeting_prompt(wa_id: str, convo: Dict[str, Any]) -> None:
@@ -297,6 +385,50 @@ def _save_state(state: Dict[str, Any]) -> None:
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(state, fh)
     tmp_path.replace(STATE_PATH)
+
+
+def _load_lead_index() -> Dict[str, Any]:
+    if not LEAD_INDEX_PATH.exists():
+        return {}
+    try:
+        with LEAD_INDEX_PATH.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _save_lead_index(data: Dict[str, Any]) -> None:
+    tmp_path = LEAD_INDEX_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    tmp_path.replace(LEAD_INDEX_PATH)
+
+
+def _store_lead_index(details: Dict[str, Any]) -> None:
+    canonical = details.get("canonical") or {}
+    phone = canonical.get("phone")
+    key = _normalize_phone(phone)
+    if not key:
+        return
+    if len(key) > 10:
+        key = key[-10:]
+    index = _load_lead_index()
+    index[key] = {
+        "leadgen_id": details.get("leadgen_id"),
+        "canonical": canonical,
+        "source": "meta_lead",
+        "created_time": details.get("created_time"),
+        "ad_name": details.get("ad_name"),
+        "form_id": details.get("form_id"),
+    }
+    _save_lead_index(index)
+
+
+def _normalize_phone(value: str | None) -> str | None:
+    if not value:
+        return None
+    digits = "".join(ch for ch in value if ch.isdigit())
+    return digits or None
 
 
 def _append_log(payload: Dict[str, Any]) -> None:
@@ -386,6 +518,7 @@ async def _process_leadgen_payload(payload: Dict[str, Any]) -> None:
             details = await _fetch_lead_details(lead_id)
             if details:
                 _append_lead_details(details)
+                _store_lead_index(details)
                 await _notify_admins_of_lead(details)
 
 

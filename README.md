@@ -24,6 +24,7 @@ META_VERIFY_TOKEN=testtoken FORWARD_URL=https://varush-webhook.onrender.com uvic
    - Optional: `WHATSAPP_PHONE_ID`, `WHATSAPP_ACCESS_TOKEN` (needed to send replies via the Cloud API)
    - Optional: `STATE_PATH` (defaults to `logs/conversations.json`) and `MEETING_LINK` for the auto-reply assistant
    - Optional: `LEAD_ACCESS_TOKEN`, `LEAD_LOG_PATH`, `LEAD_DETAILS_PATH` if you enable Meta Lead Ads ingestion
+   - Optional: `LEAD_INDEX_PATH` (defaults to `logs/lead-index.json`) to store phone → lead-field mappings
    - Optional: `ADMIN_ALERT_NUMBERS` (comma-separated WhatsApp numbers to receive lead notifications)
 3. (Optional) Attach a persistent disk (1 GB) to `/data` for log retention.
 4. Deploy. Once live, you'll get a URL like `https://varush-webhook-proxy.onrender.com/webhook`.
@@ -44,7 +45,8 @@ Subscribe your Meta app to `page` → `leadgen` events and point it to `https://
 When `WHATSAPP_*` credentials are present, the webhook automatically:
 1. Logs every inbound message.
 2. Stores per-contact conversation state in `STATE_PATH` (default `logs/conversations.json`).
-3. Sends guided replies that collect project details (service type, location, project type, area, timeline, finish, budget, assets, portfolio preference) and then offers meeting slots generated in IST. The meeting link defaults to `https://meet.varushinteriors.com/intro` but can be overridden via `MEETING_LINK`.
+3. Looks up any Meta Lead data (via `LEAD_INDEX_PATH`) and pre-fills known answers so the welcome message can reference them and the intake flow skips redundant questions.
+4. Sends guided replies that collect the remaining project details (service type, location, project type, area, timeline, finish, budget, assets, portfolio preference) and then offers meeting slots generated in IST. The meeting link defaults to `https://meet.varushinteriors.com/intro` but can be overridden via `MEETING_LINK`.
 
 ## Admin Endpoints
 
