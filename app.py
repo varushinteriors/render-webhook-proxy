@@ -77,6 +77,9 @@ async def verify(
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     payload = await request.json()
+    if payload.get("object") == "page":
+        await _handle_leadgen_payload(payload)
+        return {"status": "ok"}
     _append_log(payload)
     await _forward(payload)
     await _auto_reply(payload)
@@ -99,8 +102,7 @@ async def leadgen_verify(
 @app.post("/leadgen")
 async def handle_leadgen(request: Request):
     payload = await request.json()
-    _append_lead_log(payload)
-    await _process_leadgen_payload(payload)
+    await _handle_leadgen_payload(payload)
     return {"status": "ok"}
 
 
@@ -324,6 +326,11 @@ async def _forward(payload: Dict[str, Any]) -> None:
             resp.raise_for_status()
         except httpx.HTTPError:
             pass
+
+
+async def _handle_leadgen_payload(payload: Dict[str, Any]) -> None:
+    _append_lead_log(payload)
+    await _process_leadgen_payload(payload)
 
 
 async def _process_leadgen_payload(payload: Dict[str, Any]) -> None:
