@@ -20,20 +20,29 @@ META_VERIFY_TOKEN=testtoken FORWARD_URL=https://varush-webhook.onrender.com uvic
    - `META_VERIFY_TOKEN` (must match the token configured in WhatsApp Business Manager)
    - `FORWARD_URL` (e.g., `https://varush-webhook.onrender.com`)
    - Optional: `LOG_PATH=/data/webhook-events.log` (persistent disk)
-   - Optional: `ADMIN_TOKEN` (required if you plan to read logs via the `/events/latest` endpoint)
+   - Optional: `ADMIN_TOKEN` (required for the admin endpoints)
+   - Optional: `WHATSAPP_PHONE_ID`, `WHATSAPP_ACCESS_TOKEN` (needed to send replies via the Cloud API)
 3. (Optional) Attach a persistent disk (1 GB) to `/data` for log retention.
 4. Deploy. Once live, you'll get a URL like `https://varush-webhook-proxy.onrender.com/webhook`.
 
 ## Switching WhatsApp Webhook
 After deployment, update WhatsApp Business Manager webhook to the new URL and verify using the same `META_VERIFY_TOKEN`. Test inbound messages; the service will log them and forward to the legacy endpoint.
 
-## Admin Log Access
+## Admin Endpoints
 
-If you set `ADMIN_TOKEN`, you can fetch the most recent webhook events via:
+Set `ADMIN_TOKEN` to enable the following:
 
+### Fetch latest events
 ```
 GET /events/latest?limit=20
 Headers: X-Admin-Token: <ADMIN_TOKEN>
 ```
+Returns `{ "count": <n>, "events": [ ... ] }` with the newest WhatsApp payloads (limit default 20, max 200).
 
-The response is a JSON object with `count` and `events` (each event is the original WhatsApp payload). Limit defaults to 20 and max is 200.
+### Send a WhatsApp reply via Cloud API
+```
+POST /admin/send-message
+Headers: X-Admin-Token: <ADMIN_TOKEN>
+Body: { "to": "<wa_id>", "message": "text", "preview_url": false }
+```
+Requires `WHATSAPP_PHONE_ID` and `WHATSAPP_ACCESS_TOKEN` to be set. The endpoint relays the request to `https://graph.facebook.com/v20.0/{PHONE_ID}/messages`.
