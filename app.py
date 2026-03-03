@@ -16,9 +16,14 @@ VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
 FORWARD_URL = os.getenv("FORWARD_URL", "https://varush-webhook.onrender.com")
 LOG_PATH = Path(os.getenv("LOG_PATH", "logs/webhook-events.log"))
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+LEAD_LOG_PATH = Path(os.getenv("LEAD_LOG_PATH", "logs/leadgen-events.log"))
+LEAD_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+LEAD_DETAILS_PATH = Path(os.getenv("LEAD_DETAILS_PATH", "logs/leadgen-details.log"))
+LEAD_DETAILS_PATH.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+LEAD_ACCESS_TOKEN = os.getenv("LEAD_ACCESS_TOKEN", "") or WHATSAPP_ACCESS_TOKEN
 STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
@@ -74,6 +79,27 @@ async def handle_webhook(request: Request):
     _append_log(payload)
     await _forward(payload)
     await _auto_reply(payload)
+    return {"status": "ok"}
+
+
+@app.get("/leadgen")
+async def leadgen_verify(
+    mode: str | None = Query(default=None, alias="hub.mode"),
+    hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
+    hub_verify_token: str | None = Query(default=None, alias="hub.verify_token"),
+    plain_mode: str | None = None,
+    plain_challenge: str | None = None,
+    plain_verify_token: str | None = None,
+):
+    # Reuse the same verify token logic
+    return await verify(mode, hub_challenge, hub_verify_token, plain_mode, plain_challenge, plain_verify_token)
+
+
+@app.post("/leadgen")
+async def handle_leadgen(request: Request):
+    payload = await request.json()
+    _append_lead_log(payload)
+    await _process_leadgen_payload(payload)
     return {"status": "ok"}
 
 
@@ -251,6 +277,16 @@ def _append_log(payload: Dict[str, Any]) -> None:
         fh.write(json.dumps(payload) + "\n")
 
 
+def _append_lead_log(payload: Dict[str, Any]) -> None:
+    with LEAD_LOG_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload) + "\n")
+
+
+def _append_lead_details(data: Dict[str, Any]) -> None:
+    with LEAD_DETAILS_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(data) + "\n")
+
+
 def _read_latest_events(limit: int) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     if not LOG_PATH.exists():
@@ -287,6 +323,38 @@ async def _forward(payload: Dict[str, Any]) -> None:
             resp.raise_for_status()
         except httpx.HTTPError:
             pass
+
+
+async def _process_leadgen_payload(payload: Dict[str, Any]) -> None:
+    entries = payload.get("entry", [])
+    for entry in entries:
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            lead_id = value.get("leadgen_id")
+            if not lead_id:
+                continue
+            details = await _fetch_lead_details(lead_id)
+            if details:
+                _append_lead_details(details)
+
+
+async def _fetch_lead_details(lead_id: str) -> Dict[str, Any] | None:
+    token = LEAD_ACCESS_TOKEN
+    if not token:
+        # Nothing to do if we can’t fetch the lead details
+        return None
+    url = f"https://graph.facebook.com/v20.0/{lead_id}"
+    params = {
+        "access_token": token,
+        "fields": "created_time,ad_id,ad_name,form_id,field_data,platform,leadgen_id,page_id"
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, params=params)
+    if resp.status_code >= 400:
+        # Log the failure for visibility
+        _append_lead_details({"leadgen_id": lead_id, "error": resp.text})
+        return None
+    return resp.json()
 
 
 async def _send_whatsapp_text(to: str, message: str, preview_url: bool) -> Dict[str, Any]:
