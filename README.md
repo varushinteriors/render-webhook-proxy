@@ -20,8 +20,20 @@ META_VERIFY_TOKEN=testtoken FORWARD_URL=https://varush-webhook.onrender.com uvic
    - `META_VERIFY_TOKEN` (must match the token configured in WhatsApp Business Manager)
    - `FORWARD_URL` (e.g., `https://varush-webhook.onrender.com`)
    - Optional: `LOG_PATH=/data/webhook-events.log` (persistent disk)
+   - Optional: `ADMIN_TOKEN` (required if you plan to read logs via the `/events/latest` endpoint)
 3. (Optional) Attach a persistent disk (1 GB) to `/data` for log retention.
 4. Deploy. Once live, you'll get a URL like `https://varush-webhook-proxy.onrender.com/webhook`.
 
 ## Switching WhatsApp Webhook
 After deployment, update WhatsApp Business Manager webhook to the new URL and verify using the same `META_VERIFY_TOKEN`. Test inbound messages; the service will log them and forward to the legacy endpoint.
+
+## Admin Log Access
+
+If you set `ADMIN_TOKEN`, you can fetch the most recent webhook events via:
+
+```
+GET /events/latest?limit=20
+Headers: X-Admin-Token: <ADMIN_TOKEN>
+```
+
+The response is a JSON object with `count` and `events` (each event is the original WhatsApp payload). Limit defaults to 20 and max is 200.
