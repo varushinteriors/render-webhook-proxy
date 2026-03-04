@@ -23,6 +23,9 @@ app = FastAPI()
 async def startup_event() -> None:
     asyncio.create_task(_inactivity_watcher())
     asyncio.create_task(_meeting_reminder_watcher())
+    print("VARUSH WEBHOOK SERVER STARTED")
+    print("Lead webhook ready")
+    print("WhatsApp webhook ready")
 
 VERIFY_TOKEN_VALUES = {
     token.strip()
@@ -313,7 +316,7 @@ async def _auto_reply(payload: Dict[str, Any]) -> None:
     entries = payload.get("entry", [])
     for entry in entries:
         for change in entry.get("changes", []):
-            if change.get("field") != "leadgen":
+            if change.get("field") != "messages":
                 continue
             value = change.get("value", {})
             messages = value.get("messages")
@@ -911,18 +914,6 @@ def _build_meeting_message(label: str, meeting: Dict[str, Any], state: Dict[str,
     convo = state.get(wa_id, {})
     name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
     return template.format(name=name, link=MEETING_LINK)
-    tmp_path = LEAD_SCORE_PATH.with_suffix(".tmp")
-    with tmp_path.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh)
-    tmp_path.replace(LEAD_SCORE_PATH)
-
-
-def _record_lead_score(key: str, result: Dict[str, Any]) -> None:
-    if not key:
-        return
-    scores = _load_lead_scores()
-    scores[key] = result
-    _save_lead_scores(scores)
 
 
 def _append_log(payload: Dict[str, Any]) -> None:
@@ -944,8 +935,13 @@ def _append_lead_log(payload: Dict[str, Any]) -> None:
 
 
 def _append_lead_details(data: Dict[str, Any]) -> None:
-    with LEAD_DETAILS_PATH.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(data) + "\n")
+    print("DEBUG: writing lead details")
+    try:
+        with LEAD_DETAILS_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(data) + "\n")
+        print("DEBUG: lead details written successfully")
+    except Exception as exc:
+        print("LEAD DETAILS WRITE ERROR:", exc)
 
 
 def _init_canonical_lead() -> Dict[str, Any]:
@@ -1011,15 +1007,24 @@ async def _handle_leadgen_payload(payload: Dict[str, Any]) -> None:
 
 
 async def _process_leadgen_payload(payload: Dict[str, Any]) -> None:
+    index = _load_lead_index()
+    existing_ids = {entry.get("leadgen_id") for entry in index.values() if entry.get("leadgen_id")}
     entries = payload.get("entry", [])
     for entry in entries:
         for change in entry.get("changes", []):
+            if change.get("field") != "leadgen":
+                continue
             value = change.get("value", {})
             lead_id = value.get("leadgen_id")
             if not lead_id:
                 continue
+            if lead_id in existing_ids:
+                print(f"Duplicate lead skipped: {lead_id}")
+                continue
             details = await _fetch_lead_details(lead_id)
+            print("DEBUG: lead details fetched:", details)
             if details:
+                existing_ids.add(lead_id)
                 _append_lead_details(details)
                 _store_lead_index(details)
                 _score_lead_from_canonical(details)
