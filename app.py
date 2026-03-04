@@ -9,11 +9,12 @@ from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
 import httpx
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, Request, Response, HTTPException, Query, Header
 from pydantic import BaseModel
 
 from agents.lead_scoring import LeadInput, LeadScoringAgent
-from services.drive_client import DriveClient
 
 app = FastAPI()
 
@@ -79,19 +80,60 @@ if credentials_json:
     except json.JSONDecodeError:
         credentials_info = None
 
-drive_client = DriveClient(
-    DRIVE_PARENT_FOLDER_ID,
-    credentials_path=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-    credentials_info=credentials_info,
-)
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+R2_BUCKET = os.getenv("R2_BUCKET")
+R2_ENDPOINT = os.getenv("R2_ENDPOINT")
+R2_PREFIX = os.getenv("R2_PREFIX", "clients")
+R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip() or None
 
-def _drive_base_folder() -> Dict[str, str] | None:
-    if not drive_client.ready():
+r2_client = None
+if all([R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, R2_ENDPOINT]):
+    r2_client = boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY,
+    )
+else:
+    print("R2 client not fully configured; media will only be archived locally.")
+
+def _r2_ready() -> bool:
+    return r2_client is not None
+
+def _r2_prefix_for_key(key: str) -> str:
+    return f"{R2_PREFIX}/{key}"
+
+def _r2_prefix_for_wa(wa_id: str | None) -> str:
+    key = _phone_key_from_wa(wa_id or "") or (wa_id or "unknown")
+    return _r2_prefix_for_key(key)
+
+def _r2_public_url(object_key: str) -> str | None:
+    if not R2_PUBLIC_BASE_URL:
         return None
-    parent_id = drive_client.parent_folder_id
-    if not parent_id:
+    base = R2_PUBLIC_BASE_URL.rstrip("/")
+    return f"{base}/{object_key}"
+
+def _upload_to_r2(wa_id: str, filename: str, mime_type: str, data: bytes) -> Dict[str, str] | None:
+    if not r2_client:
         return None
-    return {"id": parent_id, "link": DriveClient.folder_link(parent_id)}
+    object_key = f"{_r2_prefix_for_wa(wa_id)}/{filename}"
+    try:
+        r2_client.put_object(
+            Bucket=R2_BUCKET,
+            Key=object_key,
+            Body=data,
+            ContentType=mime_type,
+        )
+        public_url = _r2_public_url(object_key)
+        record = {"bucket": R2_BUCKET, "key": object_key}
+        if public_url:
+            record["url"] = public_url
+        print(f"R2 UPLOAD SUCCESS: {record}")
+        return record
+    except (BotoCoreError, ClientError) as exc:
+        print(f"R2 UPLOAD ERROR: {exc}")
+        return None
 
 QUESTION_FLOW = [
     "name",
@@ -317,30 +359,26 @@ async def _handle_media_message(
         return
     download = await _download_whatsapp_media(media_id, media_info)
     print(f"DOWNLOAD RESULT: {bool(download)}")
-    print(f"DRIVE READY: {drive_client.ready()}")
+    print(f"R2 READY: {_r2_ready()}")
     if not download:
         return
     data, mime_type, filename = download
     archive_path = _archive_media_locally(wa_id, filename, data)
-    contact_name = _match_contact_name(contacts, wa_id)
-    folder = _ensure_drive_folder_for_contact(wa_id, contact_name)
-    drive_file = None
-    if folder:
-        drive_file = drive_client.upload_bytes(folder["id"], filename, mime_type, data)
-        print(f"UPLOAD RESULT: {drive_file}")
+    storage_record = _upload_to_r2(wa_id, filename, mime_type, data)
+    print(f"R2 UPLOAD RESULT: {storage_record}")
 
-    if drive_file:
+    if storage_record:
         ack = (
             "Saved your file to your secure Varush project vault. "
             "Feel free to keep sharing anything else that helps us design."
         )
     elif archive_path:
         ack = (
-            "Got it and stored it safely on our end. I’ll sync it to your Drive folder as soon as connectivity clears."
+            "Got it and stored it safely on our end. I’ll sync it to your vault as soon as connectivity clears."
         )
     else:
         ack = (
-            "Received your file—thank you! I’ll log it and keep things moving while our drive sync completes."
+            "Received your file—thank you! I’ll log it and keep things moving while our sync completes."
         )
     await _send_whatsapp_text(wa_id, ack, preview_url=False)
 
@@ -673,11 +711,10 @@ def _store_lead_index(details: Dict[str, Any]) -> None:
             "form_id": details.get("form_id"),
         }
     )
-    if not entry.get("drive_folder_id"):
-        base_folder = _drive_base_folder()
-        if base_folder:
-            entry["drive_folder_id"] = base_folder["id"]
-            entry["drive_folder_link"] = base_folder["link"]
+    if not entry.get("storage_prefix") and key:
+        entry["storage_prefix"] = _r2_prefix_for_key(key)
+    entry.pop("drive_folder_id", None)
+    entry.pop("drive_folder_link", None)
     index[key] = entry
     _save_lead_index(index)
 
@@ -770,21 +807,6 @@ async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any] | N
         filename = f"{media_id}{ext}"
     return data, mime_type, filename
 
-
-def _ensure_drive_folder_for_contact(wa_id: str, contact_name: str | None) -> Dict[str, str] | None:
-    base_folder = _drive_base_folder()
-    if not base_folder:
-        return None
-    key = _phone_key_from_wa(wa_id) or wa_id
-    index = _load_lead_index()
-    entry = index.get(key)
-    if not entry:
-        entry = {"canonical": {}, "wa_id": wa_id}
-        index[key] = entry
-    entry["drive_folder_id"] = base_folder["id"]
-    entry["drive_folder_link"] = base_folder["link"]
-    _save_lead_index(index)
-    return base_folder
 
 
 def _archive_media_locally(wa_id: str, filename: str, data: bytes) -> Path | None:
