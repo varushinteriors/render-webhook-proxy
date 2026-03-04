@@ -82,7 +82,8 @@ class DriveClient:
             )
             print(f"DRIVE UPLOAD SUCCESS: {file}")
             return file
-        except HttpError:
+        except HttpError as exc:
+            print(f"DRIVE UPLOAD ERROR: {exc}")
             return None
 
     @staticmethod
