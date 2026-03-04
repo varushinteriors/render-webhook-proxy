@@ -739,12 +739,12 @@ async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any] | N
             meta_resp = await client.get(
                 f"{GRAPH_API_BASE}/{media_id}",
                 headers=headers,
-                params={"messaging_product": "whatsapp"},
             )
             meta_resp.raise_for_status()
             meta = meta_resp.json()
             url = meta.get("url")
             if not url:
+                print(f"MEDIA META RESPONSE MISSING URL: {meta}")
                 return None
             mime_type = meta.get("mime_type") or media_info.get("mime_type") or "application/octet-stream"
             download_resp = await client.get(url, headers=headers)
