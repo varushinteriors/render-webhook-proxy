@@ -1035,7 +1035,7 @@ async def _fetch_lead_details(lead_id: str) -> Dict[str, Any] | None:
     url = f"https://graph.facebook.com/v20.0/{lead_id}"
     params = {
         "access_token": token,
-        "fields": "created_time,ad_id,ad_name,form_id,field_data,platform,leadgen_id,page_id"
+        "fields": "created_time,ad_id,ad_name,form_id,field_data,platform"
     }
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url, params=params)
@@ -1045,6 +1045,7 @@ async def _fetch_lead_details(lead_id: str) -> Dict[str, Any] | None:
         _append_lead_details({"leadgen_id": lead_id, "error": resp.text})
         return None
     data = resp.json()
+    data["leadgen_id"] = lead_id
     data["canonical"] = _normalize_lead_fields(data.get("field_data", []))
     print("LEAD FETCH SUCCESS")
     return data
