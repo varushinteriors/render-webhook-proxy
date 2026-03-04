@@ -50,7 +50,7 @@ class DriveClient:
             folder = (
                 self._service_client()
                 .files()
-                .create(body=metadata, fields="id, name")
+                .create(body=metadata, fields="id, name", supportsAllDrives=True)
                 .execute()
             )
             # Make link-shareable (viewer)
@@ -77,7 +77,7 @@ class DriveClient:
             file = (
                 self._service_client()
                 .files()
-                .create(body=metadata, media_body=media, fields="id, name, webViewLink")
+                .create(body=metadata, media_body=media, fields="id, name, webViewLink", supportsAllDrives=True)
                 .execute()
             )
             print(f"DRIVE UPLOAD SUCCESS: {file}")
