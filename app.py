@@ -53,19 +53,15 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "").strip()
-SECONDARY_LEAD_TOKEN = os.getenv("LEAD_ACCESS_TOKEN", "").strip()
-LEAD_ACCESS_TOKEN = PAGE_ACCESS_TOKEN or SECONDARY_LEAD_TOKEN or WHATSAPP_ACCESS_TOKEN
+LEAD_ACCESS_TOKEN = PAGE_ACCESS_TOKEN
+if not LEAD_ACCESS_TOKEN:
+    print("ERROR: PAGE_ACCESS_TOKEN missing – leadgen fetch will fail")
 ADMIN_ALERT_NUMBERS = [n.strip() for n in os.getenv("ADMIN_ALERT_NUMBERS", "").split(",") if n.strip()]
-DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID", "1L-LHTKvA-l9gxtWaxH68JlMZQ2Glg2ql")
 PORTFOLIO_LINK = os.getenv(
     "DRIVE_PORTFOLIO_LINK",
     "https://drive.google.com/drive/folders/1WBJf_7zCLb5XxpbryxCSoUiKc13DzerC",
 )
 GRAPH_API_BASE = "https://graph.facebook.com/v20.0"
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "").strip()
-SECONDARY_LEAD_TOKEN = os.getenv("LEAD_ACCESS_TOKEN", "").strip()
-LEAD_ACCESS_TOKEN = PAGE_ACCESS_TOKEN or SECONDARY_LEAD_TOKEN or WHATSAPP_ACCESS_TOKEN
-ADMIN_ALERT_NUMBERS = [n.strip() for n in os.getenv("ADMIN_ALERT_NUMBERS", "").split(",") if n.strip()]
 STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
@@ -317,6 +313,8 @@ async def _auto_reply(payload: Dict[str, Any]) -> None:
     entries = payload.get("entry", [])
     for entry in entries:
         for change in entry.get("changes", []):
+            if change.get("field") != "leadgen":
+                continue
             value = change.get("value", {})
             messages = value.get("messages")
             if not messages:
@@ -1007,6 +1005,7 @@ async def _forward(payload: Dict[str, Any]) -> None:
 
 
 async def _handle_leadgen_payload(payload: Dict[str, Any]) -> None:
+    print("LEADGEN WEBHOOK RECEIVED")
     _append_lead_log(payload)
     await _process_leadgen_payload(payload)
 
@@ -1030,8 +1029,9 @@ async def _process_leadgen_payload(payload: Dict[str, Any]) -> None:
 async def _fetch_lead_details(lead_id: str) -> Dict[str, Any] | None:
     token = LEAD_ACCESS_TOKEN
     if not token:
-        # Nothing to do if we can’t fetch the lead details
+        print("LEAD FETCH SKIPPED: PAGE_ACCESS_TOKEN not configured")
         return None
+    print(f"FETCHING LEAD DETAILS: {lead_id}")
     url = f"https://graph.facebook.com/v20.0/{lead_id}"
     params = {
         "access_token": token,
@@ -1039,12 +1039,14 @@ async def _fetch_lead_details(lead_id: str) -> Dict[str, Any] | None:
     }
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url, params=params)
+    print(f"LEAD FETCH STATUS: {resp.status_code}")
     if resp.status_code >= 400:
-        # Log the failure for visibility
+        print(f"LEAD FETCH ERROR: {resp.text}")
         _append_lead_details({"leadgen_id": lead_id, "error": resp.text})
         return None
     data = resp.json()
     data["canonical"] = _normalize_lead_fields(data.get("field_data", []))
+    print("LEAD FETCH SUCCESS")
     return data
 
 
@@ -1052,6 +1054,7 @@ async def _notify_admins_of_lead(details: Dict[str, Any]) -> None:
     if not ADMIN_ALERT_NUMBERS:
         return
     summary = _format_lead_summary(details)
+    print(f"NOTIFYING ADMINS: {ADMIN_ALERT_NUMBERS}")
     for number in ADMIN_ALERT_NUMBERS:
         try:
             await _send_whatsapp_text(number, summary, preview_url=False)
