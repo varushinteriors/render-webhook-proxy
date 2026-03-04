@@ -197,12 +197,17 @@ CANONICAL_LEAD_FIELDS = [
 ]
 
 LEAD_FIELD_MAP = {
-    "name": "full_name",
+    "full_name": "full_name",
+    "full name": "full_name",
     "email": "email",
     "phone": "phone",
+    "what_is_your_property_type?": "project_type",
     "what is your property type?": "project_type",
+    "what_is_your_budget_for_interior_project?": "budget_bracket",
     "what is your budget for interior project?": "budget_bracket",
+    "how_soon_are_you_planning_to_get_started?": "timeline",
     "how soon are you planning to get started?": "timeline",
+    "where_is_your_property_located?": "project_location",
     "where is your property located?": "project_location",
 }
 
@@ -951,8 +956,9 @@ def _init_canonical_lead() -> Dict[str, Any]:
 def _normalize_lead_fields(field_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     canonical = _init_canonical_lead()
     for item in field_data or []:
-        name = ((item.get("name") or "").strip().lower().replace("_", " "))
-        key = LEAD_FIELD_MAP.get(name)
+        raw_name = (item.get("name") or "").strip().lower()
+        normalized_name = raw_name.replace("_", " ")
+        key = LEAD_FIELD_MAP.get(raw_name) or LEAD_FIELD_MAP.get(normalized_name)
         if not key:
             continue
         values = item.get("values") or []
@@ -1076,6 +1082,8 @@ def _format_lead_summary(details: Dict[str, Any]) -> str:
     highlights: List[str] = []
     if canonical.get("full_name"):
         highlights.append(f"Name: {canonical['full_name']}")
+    if canonical.get("phone"):
+        highlights.append(f"Phone: {canonical['phone']}")
     if canonical.get("project_location"):
         highlights.append(f"Location: {canonical['project_location']}")
     if canonical.get("project_type"):
@@ -1088,8 +1096,7 @@ def _format_lead_summary(details: Dict[str, Any]) -> str:
     return (
         f"New Meta lead captured (Form {form_id}).\n"
         f"Ad: {ad_name}\n"
-        f"Received: {created}\n"
-        f"Lead ID: {details.get('leadgen_id')}\n\n"
+        f"Received: {created}\n\n"
         f"{highlight_text}"
     )
 
