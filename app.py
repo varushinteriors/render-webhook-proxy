@@ -319,6 +319,7 @@ async def _handle_media_message(
     drive_file = None
     if folder:
         drive_file = drive_client.upload_bytes(folder["id"], filename, mime_type, data)
+        print(f"UPLOAD RESULT: {drive_file}")
 
     if drive_file:
         ack = (
