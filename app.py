@@ -724,9 +724,10 @@ def _normalize_phone(value: str | None) -> str | None:
     return digits or None
 
 
-async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any]) -> tuple[bytes, str, str] | None:
+async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any] | None = None) -> tuple[bytes, str, str] | None:
     if not WHATSAPP_ACCESS_TOKEN:
         return None
+    media_info = media_info or {}
     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
