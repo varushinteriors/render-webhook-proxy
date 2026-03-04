@@ -58,7 +58,8 @@ class DriveClient:
                 fileId=folder["id"], body={"role": "commenter", "type": "anyone"}
             ).execute()
             return folder
-        except HttpError:
+        except HttpError as exc:
+            print(f"DRIVE UPLOAD ERROR: {exc}")
             return None
 
     def upload_bytes(
@@ -70,7 +71,7 @@ class DriveClient:
     ) -> Optional[dict]:
         if not self.ready():
             return None
-        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=False)
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=True)
         metadata = {"name": filename, "parents": [folder_id]}
         try:
             file = (
@@ -79,6 +80,7 @@ class DriveClient:
                 .create(body=metadata, media_body=media, fields="id, name, webViewLink")
                 .execute()
             )
+            print(f"DRIVE UPLOAD SUCCESS: {file}")
             return file
         except HttpError:
             return None
