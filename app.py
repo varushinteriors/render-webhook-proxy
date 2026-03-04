@@ -747,9 +747,12 @@ async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any] | N
                 print(f"MEDIA META RESPONSE MISSING URL: {meta}")
                 return None
             mime_type = meta.get("mime_type") or media_info.get("mime_type") or "application/octet-stream"
-            download_resp = await client.get(url, headers=headers)
+            download_resp = await client.get(url, headers=headers, follow_redirects=True)
             download_resp.raise_for_status()
             data = download_resp.content
+            print(f"MEDIA SIZE: {len(data)}")
+            if not data:
+                return None
     except httpx.HTTPError as exc:
         print(f"MEDIA DOWNLOAD ERROR: {exc}")
         return None
