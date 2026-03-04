@@ -85,6 +85,14 @@ drive_client = DriveClient(
     credentials_info=credentials_info,
 )
 
+def _drive_base_folder() -> Dict[str, str] | None:
+    if not drive_client.ready():
+        return None
+    parent_id = drive_client.parent_folder_id
+    if not parent_id:
+        return None
+    return {"id": parent_id, "link": DriveClient.folder_link(parent_id)}
+
 QUESTION_FLOW = [
     "name",
     "service_type",
@@ -666,11 +674,10 @@ def _store_lead_index(details: Dict[str, Any]) -> None:
         }
     )
     if not entry.get("drive_folder_id"):
-        display_name = canonical.get("full_name") or canonical.get("phone") or key
-        folder = drive_client.ensure_folder(f"Lead - {display_name}") if drive_client.ready() else None
-        if folder:
-            entry["drive_folder_id"] = folder["id"]
-            entry["drive_folder_link"] = DriveClient.folder_link(folder["id"])
+        base_folder = _drive_base_folder()
+        if base_folder:
+            entry["drive_folder_id"] = base_folder["id"]
+            entry["drive_folder_link"] = base_folder["link"]
     index[key] = entry
     _save_lead_index(index)
 
@@ -765,25 +772,19 @@ async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any] | N
 
 
 def _ensure_drive_folder_for_contact(wa_id: str, contact_name: str | None) -> Dict[str, str] | None:
-    if not drive_client.ready():
+    base_folder = _drive_base_folder()
+    if not base_folder:
         return None
     key = _phone_key_from_wa(wa_id) or wa_id
     index = _load_lead_index()
     entry = index.get(key)
-    if entry and entry.get("drive_folder_id"):
-        return {"id": entry["drive_folder_id"], "link": entry.get("drive_folder_link", "")}
-    display_name = contact_name or f"Lead {wa_id[-4:]}"
-    folder = drive_client.ensure_folder(f"Lead - {display_name}")
-    if not folder:
-        return None
-    folder_link = DriveClient.folder_link(folder["id"])
     if not entry:
         entry = {"canonical": {}, "wa_id": wa_id}
         index[key] = entry
-    entry["drive_folder_id"] = folder["id"]
-    entry["drive_folder_link"] = folder_link
+    entry["drive_folder_id"] = base_folder["id"]
+    entry["drive_folder_link"] = base_folder["link"]
     _save_lead_index(index)
-    return {"id": folder["id"], "link": folder_link}
+    return base_folder
 
 
 def _archive_media_locally(wa_id: str, filename: str, data: bytes) -> Path | None:
