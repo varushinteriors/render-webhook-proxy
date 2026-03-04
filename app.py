@@ -46,6 +46,8 @@ MEETINGS_PATH = Path(os.getenv("MEETINGS_PATH", "logs/meetings.json"))
 MEETINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
 LEAD_ENGAGEMENT_PATH = Path(os.getenv("LEAD_ENGAGEMENT_PATH", "logs/lead-engagement.json"))
 LEAD_ENGAGEMENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+MEDIA_ARCHIVE_PATH = Path(os.getenv("MEDIA_ARCHIVE_PATH", "logs/media"))
+MEDIA_ARCHIVE_PATH.mkdir(parents=True, exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
@@ -303,19 +305,25 @@ async def _handle_media_message(
     media_id = media_info.get("id")
     if not media_id:
         return
-    download = await _download_whatsapp_media(media_id)
+    download = await _download_whatsapp_media(media_id, media_info)
     if not download:
         return
     data, mime_type, filename = download
+    archive_path = _archive_media_locally(wa_id, filename, data)
     contact_name = _match_contact_name(contacts, wa_id)
     folder = _ensure_drive_folder_for_contact(wa_id, contact_name)
-    if not folder:
-        return
-    uploaded = drive_client.upload_bytes(folder["id"], filename, mime_type, data)
-    if uploaded:
+    drive_file = None
+    if folder:
+        drive_file = drive_client.upload_bytes(folder["id"], filename, mime_type, data)
+
+    if drive_file:
         ack = (
             "Saved your file to your secure Varush project vault. "
             "Feel free to keep sharing anything else that helps us design."
+        )
+    elif archive_path:
+        ack = (
+            "Got it and stored it safely on our end. I’ll sync it to your Drive folder as soon as connectivity clears."
         )
     else:
         ack = (
@@ -763,6 +771,32 @@ def _ensure_drive_folder_for_contact(wa_id: str, contact_name: str | None) -> Di
     entry["drive_folder_link"] = folder_link
     _save_lead_index(index)
     return {"id": folder["id"], "link": folder_link}
+
+
+def _archive_media_locally(wa_id: str, filename: str, data: bytes) -> Path | None:
+    try:
+        key = _phone_key_from_wa(wa_id) or wa_id
+        safe_name = _sanitize_filename(filename)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        folder = MEDIA_ARCHIVE_PATH / key
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{timestamp}_{safe_name}"
+        path.write_bytes(data)
+        return path
+    except OSError:
+        return None
+
+
+def _sanitize_filename(filename: str) -> str:
+    base = filename or "attachment"
+    safe = []
+    for ch in base:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            safe.append(ch)
+        else:
+            safe.append("_")
+    cleaned = "".join(safe).strip("._")
+    return cleaned or "file"
 
 
 def _load_lead_scores() -> Dict[str, Any]:
