@@ -951,8 +951,8 @@ def _init_canonical_lead() -> Dict[str, Any]:
 def _normalize_lead_fields(field_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     canonical = _init_canonical_lead()
     for item in field_data or []:
-        name = (item.get("name") or "").strip()
-        key = LEAD_FIELD_MAP.get(name.lower())
+        name = ((item.get("name") or "").strip().lower().replace("_", " "))
+        key = LEAD_FIELD_MAP.get(name)
         if not key:
             continue
         values = item.get("values") or []
