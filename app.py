@@ -303,9 +303,13 @@ async def _handle_media_message(
 ) -> None:
     media_info = message.get(msg_type, {}) or {}
     media_id = media_info.get("id")
+    print(f"MEDIA TYPE: {msg_type}")
+    print(f"MEDIA ID: {media_id}")
     if not media_id:
         return
     download = await _download_whatsapp_media(media_id, media_info)
+    print(f"DOWNLOAD RESULT: {bool(download)}")
+    print(f"DRIVE READY: {drive_client.ready()}")
     if not download:
         return
     data, mime_type, filename = download
@@ -725,10 +729,11 @@ def _normalize_phone(value: str | None) -> str | None:
 
 
 async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any] | None = None) -> tuple[bytes, str, str] | None:
-    if not WHATSAPP_ACCESS_TOKEN:
+    token = WHATSAPP_ACCESS_TOKEN or PAGE_ACCESS_TOKEN
+    if not token:
         return None
     media_info = media_info or {}
-    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    headers = {"Authorization": f"Bearer {token}"}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             meta_resp = await client.get(
@@ -739,11 +744,14 @@ async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any] | N
             meta_resp.raise_for_status()
             meta = meta_resp.json()
             url = meta.get("url")
+            if not url:
+                return None
             mime_type = meta.get("mime_type") or media_info.get("mime_type") or "application/octet-stream"
             download_resp = await client.get(url, headers=headers)
             download_resp.raise_for_status()
             data = download_resp.content
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        print(f"MEDIA DOWNLOAD ERROR: {exc}")
         return None
     filename = media_info.get("filename")
     if not filename:
