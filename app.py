@@ -1069,9 +1069,10 @@ async def _notify_admins_of_lead(details: Dict[str, Any]) -> None:
     print(f"NOTIFYING ADMINS: {ADMIN_ALERT_NUMBERS}")
     for number in ADMIN_ALERT_NUMBERS:
         try:
-            await _send_whatsapp_text(number, summary, preview_url=False)
-        except HTTPException:
-            continue
+            resp = await _send_whatsapp_text(number, summary, preview_url=False)
+            print(f"WHATSAPP SENT SUCCESSFULLY TO {number}: {resp}")
+        except HTTPException as exc:
+            print(f"WHATSAPP SEND FAILED FOR {number}: {exc.detail}")
 
 
 def _format_lead_summary(details: Dict[str, Any]) -> str:
