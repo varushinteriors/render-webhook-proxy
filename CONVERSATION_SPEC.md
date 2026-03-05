@@ -20,13 +20,18 @@ Every inbound message is routed through a lightweight intent detector (LLM or ru
 | `ask_portfolio` | Client explicitly requests our work samples/portfolio. | “Can you share your portfolio?” | Send the curated link + keep the flow moving. |
 | `pricing_query` | Client wants costing/quotes. | “What’s your pricing?” | Share tier guidance, push for a 10‑min intro call, escalate if they still insist on a quote. |
 | `objection` | Pushback to the offer/question (no calls, “designers are expensive”, “not hiring”). | “I don’t want a consultation”, “Designers overcharge.” | Acknowledge politely, reinforce the 45‑day guarantee + direct factory-to-project + in-house designers, then continue the flow. |
+| `confusion` | The user isn’t sure why you’re asking or how to proceed. | “Why so many questions?”, “Not sure what you need.” | Reassure them, outline the short list of essentials, then offer **one** gentle follow-up. |
 | `smalltalk` | Greetings/polite chatter with no project info. | “Hi”, “Thanks”, “Ok”, “Great.” | Acknowledge warmly, do **not** change lead data, immediately ask the next missing field. |
 | `handoff` | They ask for a human / issue beyond automation. | “Need to talk to your designer.” | Pause automation, alert admins, reassure the client. |
 | `unknown` | LLM isn’t confident (<0.6) or message is ambiguous. | “???” | Ask for clarification before logging anything. |
 
 **Smalltalk handling.** Treat the greetings/polite fillers listed above strictly as `smalltalk`: acknowledge them, but never write to `answers`. Immediately follow with the highest-priority missing question so the flow keeps moving.
 
+**One-question rule.** Keep responses conversational—never chain multiple intake prompts. If the user objects or is confused, explain why the detail helps (location + property type + approx area) before asking a single follow-up.
+
 **Objection messaging.** When a client pushes back (no calls, doesn’t want to hire, says designers overcharge, refuses to answer), the agent must: (1) empathize, (2) remind them of Varush’s pillars—45-day guaranteed execution after design approval, direct factory-to-project modular delivery (zero middlemen, zero delays, consistent workmanship), and our in-house expert team—and (3) steer gently back to the flow.
+
+**Confusion handling.** If they’re unsure what to share, remind them we typically only need location + property type + approximate size to offer useful ideas, then ask **one** follow-up.
 
 The LLM returns a JSON object like:
 ```json
@@ -129,5 +134,6 @@ The LLM returns a JSON object like:
 6. **Low-confidence / unknown** – Send a vague message (“Hmm maybe”) and ensure it returns intent=`clarification` or `unknown`, keeps `fields_detected` empty, and explicitly asks for clarification.
 7. **Objection handling** – “Interior designers charge too much” → intent=`objection`, response references the guarantee + factory-to-project + in-house team, then resumes the intake.
 8. **Returning client recap** – Reconnect after a prior intake. Expect the recap summary + “new / edit / continue” prompt. Reply “new” (state resets), “edit” (stays in edit mode), and “continue” (jumps to next missing question).
+9. **Confusion flow** – “Why so many questions?” should trigger intent=`confusion`, give the short explainer (location + property + size), then ask just one follow-up.
 
 This doc now mirrors the production conversation engine (Step 3). Keep it updated as we add re-engagement templates or new intents.

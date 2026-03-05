@@ -199,6 +199,8 @@ QUESTION_PROMPTS = {
     "portfolio": f"Would you like to see our latest work portfolio? Here’s a quick look: {PORTFOLIO_LINK}",
 }
 
+INTENTS_THAT_SKIP_FORCED_PROMPT = {"smalltalk", "objection", "confusion"}
+
 MAX_HISTORY_LENGTH = 40
 ESCALATION_INTENTS = {"pricing_query"}
 ESCALATION_THRESHOLD = 2
@@ -568,7 +570,7 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     confidence = result.confidence if result.confidence is not None else 1.0
     requires_clarification = (confidence < CONFIDENCE_MIN_SCORE and intent not in {"smalltalk"}) or intent == "unknown"
 
-    if intent not in {"smalltalk", "objection"} and not requires_clarification:
+    if intent not in {"smalltalk", "objection", "confusion"} and not requires_clarification:
         for field, value in (result.fields_detected or {}).items():
             if field not in allowed_fields or value is None:
                 continue
@@ -588,6 +590,7 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
 
     needs_handoff = bool(result.needs_human)
     handoff_reason = result.handoff_reason
+    skip_forced_follow = intent in INTENTS_THAT_SKIP_FORCED_PROMPT
 
     if intent in ESCALATION_INTENTS and not requires_clarification:
         escalations = convo.setdefault("escalations", {})
@@ -628,7 +631,7 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
         if clarify_prompt:
             reply_parts.append(clarify_prompt.strip())
         follow_field = clarify_field
-    elif next_field:
+    elif next_field and not skip_forced_follow:
         follow_text = result.follow_up_prompt or _build_question_prompt(next_field, convo)
         if follow_text:
             reply_parts.append(follow_text.strip())
