@@ -200,6 +200,7 @@ QUESTION_PROMPTS = {
 }
 
 INTENTS_THAT_SKIP_FORCED_PROMPT = {"smalltalk", "objection", "confusion"}
+GENTLE_RECOVERY_FIELDS = ["location", "project_type", "area"]
 
 MAX_HISTORY_LENGTH = 40
 ESCALATION_INTENTS = {"pricing_query"}
@@ -591,6 +592,8 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     needs_handoff = bool(result.needs_human)
     handoff_reason = result.handoff_reason
     skip_forced_follow = intent in INTENTS_THAT_SKIP_FORCED_PROMPT
+    if skip_forced_follow:
+        next_field = None
 
     if intent in ESCALATION_INTENTS and not requires_clarification:
         escalations = convo.setdefault("escalations", {})
@@ -615,14 +618,25 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
 
     reply_parts: List[str] = []
     follow_field = None
+    fallback_follow_field = None
     reply_text = result.reply.strip() if result.reply else ""
     if intent == "ask_portfolio" and PORTFOLIO_LINK not in reply_text:
         portfolio_line = f"Here’s our latest work portfolio: {PORTFOLIO_LINK}"
         reply_text = f"{reply_text}\n\n{portfolio_line}".strip() if reply_text else portfolio_line
+    if intent in {"objection", "confusion"} and not reply_text:
+        explainer = (
+            "Totally fair! I only ask a couple of quick details so our designer can share precise ideas instead of generic advice."
+            "\n\nUsually we just note the location, property type, and approximate size."
+        )
+        gentle_field = next((field for field in GENTLE_RECOVERY_FIELDS if not convo.get("answers", {}).get(field)), None)
+        if gentle_field:
+            explainer = f"{explainer}\n\n{_build_question_prompt(gentle_field, convo)}"
+            fallback_follow_field = gentle_field
+        reply_text = explainer
     if reply_text:
         reply_parts.append(reply_text)
 
-    if requires_clarification:
+    if requires_clarification and not skip_forced_follow:
         clarify_field = convo.get("awaiting_field") or next_field
         if clarify_field:
             clarify_prompt = result.follow_up_prompt or _build_question_prompt(clarify_field, convo)
@@ -643,6 +657,8 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
         await _send_whatsapp_text(wa_id, message, preview_url=False)
         _append_history(convo, "bot", message)
         convo["has_welcomed"] = True
+    if not follow_field and fallback_follow_field:
+        follow_field = fallback_follow_field
     convo["awaiting_field"] = follow_field
 
     should_offer_meeting = (result.request_meeting and not requires_clarification) or (not _missing_fields(convo) and not requires_clarification)

@@ -50,6 +50,7 @@ The LLM returns a JSON object like:
    - If `needs_human` or client explicitly requested, set `convo["status"] = "handoff"`, notify admins, stop auto-messaging.
    - Else if `ready_to_book`, send meeting slots (skip unanswered fields unless critical like `service_type`).
    - Else if unanswered fields remain, ask only the highest-priority missing field (preference order: service → location → project → area → timeline → finish → budget → assets → portfolio).
+   - Prefer the LLM-provided `next_field`; only fall back to the default order when the model leaves it blank.
    - Else send a summary + meeting prompt if not already completed.
 3. **Craft the reply.** Use the LLM to draft natural text, but require it to return a structured block:
 ```json
