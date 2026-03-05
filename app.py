@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request, Response, HTTPException, Query, Header
 from pydantic import BaseModel
 
 from agents.lead_scoring import LeadInput, LeadScoringAgent
+from services.conversation_agent import ConversationAgent, ConversationAgentResult
 
 app = FastAPI()
 
@@ -71,6 +72,7 @@ MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro
 IST = ZoneInfo("Asia/Kolkata")
 
 scoring_agent = LeadScoringAgent()
+conversation_agent = ConversationAgent()
 credentials_info = None
 credentials_json = os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
 if credentials_json:
@@ -83,8 +85,12 @@ R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
-R2_PREFIX = os.getenv("R2_PREFIX", "clients")
+R2_PREFIX = os.getenv("R2_PREFIX", "clients").strip("/")
 R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "").strip() or None
+
+STATE_R2_KEY = os.getenv("STATE_R2_KEY") or (f"{R2_PREFIX}/state/conversations.json" if R2_PREFIX else "state/conversations.json")
+LEAD_INDEX_R2_KEY = os.getenv("LEAD_INDEX_R2_KEY") or (f"{R2_PREFIX}/state/lead-index.json" if R2_PREFIX else "state/lead-index.json")
+LEAD_SCORE_R2_KEY = os.getenv("LEAD_SCORE_R2_KEY") or (f"{R2_PREFIX}/state/lead-scores.json" if R2_PREFIX else "state/lead-scores.json")
 
 r2_client = None
 if all([R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, R2_ENDPOINT]):
@@ -134,6 +140,39 @@ def _upload_to_r2(wa_id: str, filename: str, mime_type: str, data: bytes) -> Dic
         print(f"R2 UPLOAD ERROR: {exc}")
         return None
 
+def _r2_download_to_path(key: str | None, path: Path) -> bool:
+    if not (r2_client and key):
+        return False
+    tmp_path = path.with_suffix('.download')
+    try:
+        r2_client.download_file(R2_BUCKET, key, str(tmp_path))
+        tmp_path.replace(path)
+        return True
+    except ClientError as exc:
+        error_code = exc.response.get('Error', {}).get('Code') if hasattr(exc, 'response') else None
+        if error_code not in {'NoSuchKey', '404'}:
+            print(f"R2 DOWNLOAD ERROR ({key}): {exc}")
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        return False
+    except (BotoCoreError, OSError) as exc:
+        print(f"R2 DOWNLOAD ERROR ({key}): {exc}")
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        return False
+
+
+def _r2_upload_path(path: Path, key: str | None) -> None:
+    if not (r2_client and key):
+        return
+    if not path.exists():
+        return
+    try:
+        r2_client.upload_file(str(path), R2_BUCKET, key, ExtraArgs={"ContentType": "application/json"})
+    except (BotoCoreError, ClientError) as exc:
+        print(f"R2 STATE UPLOAD ERROR ({key}): {exc}")
+
+
 QUESTION_FLOW = [
     "name",
     "service_type",
@@ -159,6 +198,12 @@ QUESTION_PROMPTS = {
     "assets": "Do you have any layouts or site photos you can share here?",
     "portfolio": f"Would you like to see our latest work portfolio? Here’s a quick look: {PORTFOLIO_LINK}",
 }
+
+MAX_HISTORY_LENGTH = 40
+ESCALATION_INTENTS = {"pricing_query"}
+ESCALATION_THRESHOLD = 2
+CONFIDENCE_MIN_SCORE = 0.6
+RECAP_COOLDOWN_SECONDS = 3600
 
 INACTIVITY_INITIAL_DELAY = 180  # seconds (3 minutes)
 INACTIVITY_INTERVAL = 60  # seconds between nudges
@@ -396,8 +441,22 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         "awaiting_field": None,
         "completed": False,
         "has_welcomed": False,
+        "history": [],
+        "status": "active",
+        "escalations": {},
+        "has_recap_prompted": False,
+        "awaiting_recap_choice": False,
+        "last_recap_ts": 0.0,
     })
+    convo.setdefault("answers", {})
+    convo.setdefault("history", [])
+    convo.setdefault("escalations", {})
+    convo.setdefault("status", "active")
+    convo.setdefault("has_recap_prompted", False)
+    convo.setdefault("awaiting_recap_choice", False)
+    convo.setdefault("last_recap_ts", 0.0)
 
+    previous_last_ts = convo.get("last_client_ts")
     now_ts = datetime.now(timezone.utc).timestamp()
     convo["last_client_ts"] = now_ts
     convo["inactivity_reminders_sent"] = 0
@@ -405,57 +464,330 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     convo["inactivity_paused"] = False
     convo["inactivity_soft_closed"] = False
 
-    # Record the contact name if we have it and haven't saved one yet
-    if contact_name and "contact_name" not in convo:
+    if contact_name and not convo.get("contact_name"):
         convo["contact_name"] = contact_name
 
-    # Save answer for the question we were waiting on
+    if convo.get("status") == "handoff":
+        ack = (
+            "Our lead designer is already reviewing your request. They’ll jump in shortly with the next update."
+        )
+        await _send_whatsapp_text(wa_id, ack, preview_url=False)
+        _append_history(convo, "bot", ack)
+        state[wa_id] = convo
+        _save_state(state)
+        return
+
     awaiting_field = convo.get("awaiting_field")
     if awaiting_field:
-        convo.setdefault("answers", {})[awaiting_field] = incoming_text
+        convo["answers"][awaiting_field] = incoming_text
         if awaiting_field == "name" and not convo.get("contact_name"):
             convo["contact_name"] = incoming_text
         convo["awaiting_field"] = None
 
     _hydrate_state_from_lead(wa_id, convo)
 
+    if incoming_text:
+        _append_history(convo, "client", incoming_text)
+
+    if convo.get("awaiting_recap_choice"):
+        handled = await _process_recap_choice(wa_id, convo, incoming_text)
+        if handled:
+            state[wa_id] = convo
+            _save_state(state)
+            return
+
+    if _should_prompt_recap(convo, now_ts):
+        await _send_recap_prompt(wa_id, convo, now_ts)
+        state[wa_id] = convo
+        _save_state(state)
+        return
+
     if convo.get("completed"):
-        # Send a polite acknowledgement but avoid restarting the flow
         ack = _build_followup_ack(convo)
         await _send_whatsapp_text(wa_id, ack, preview_url=False)
+        _append_history(convo, "bot", ack)
         state[wa_id] = convo
         _save_state(state)
         _score_lead_from_conversation(wa_id, convo)
         return
 
+    if not conversation_agent.is_ready:
+        await _run_legacy_flow(wa_id, convo, state)
+        return
+
+    agent_result = await conversation_agent.generate_response(
+        answers=convo.get("answers", {}),
+        missing_fields=_missing_fields(convo),
+        awaiting_field=convo.get("awaiting_field"),
+        history=convo.get("history", []),
+        message=incoming_text,
+        contact_name=convo.get("contact_name"),
+        portfolio_link=PORTFOLIO_LINK,
+    )
+
+    if not agent_result:
+        await _run_legacy_flow(wa_id, convo, state)
+        return
+
+    await _run_agent_flow(wa_id, convo, state, agent_result)
+
+
+async def _run_legacy_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, Any]) -> None:
     next_field = _next_missing_field(convo)
     if not next_field:
         if not convo.get("has_welcomed"):
             welcome = _build_welcome_message(convo)
             if welcome:
                 await _send_whatsapp_text(wa_id, welcome, preview_url=False)
+                _append_history(convo, "bot", welcome)
             convo["has_welcomed"] = True
         await _send_meeting_prompt(wa_id, convo)
         convo["completed"] = True
-        state[wa_id] = convo
-        _save_state(state)
-        _score_lead_from_conversation(wa_id, convo)
-        return
-
-    prompt = _build_question_prompt(next_field, convo)
-    convo["awaiting_field"] = next_field
-
-    if not convo.get("has_welcomed"):
-        welcome = _build_welcome_message(convo)
-        message = f"{welcome}\n\n{prompt}" if welcome else prompt
-        convo["has_welcomed"] = True
+        convo["status"] = "completed"
+        convo["awaiting_field"] = None
     else:
-        message = prompt
-
-    await _send_whatsapp_text(wa_id, message, preview_url=False)
+        prompt = _build_question_prompt(next_field, convo)
+        convo["awaiting_field"] = next_field
+        if not convo.get("has_welcomed"):
+            welcome = _build_welcome_message(convo)
+            message = f"{welcome}\n\n{prompt}" if welcome else prompt
+            convo["has_welcomed"] = True
+        else:
+            message = prompt
+        await _send_whatsapp_text(wa_id, message, preview_url=False)
+        _append_history(convo, "bot", message)
     state[wa_id] = convo
     _save_state(state)
     _score_lead_from_conversation(wa_id, convo)
+
+
+async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, Any], result: ConversationAgentResult) -> None:
+    answers = convo.setdefault("answers", {})
+    allowed_fields = set(QUESTION_FLOW)
+    intent = (result.intent or "unknown").lower()
+    confidence = result.confidence if result.confidence is not None else 1.0
+    requires_clarification = (confidence < CONFIDENCE_MIN_SCORE and intent not in {"smalltalk"}) or intent == "unknown"
+
+    if intent not in {"smalltalk", "objection"} and not requires_clarification:
+        for field, value in (result.fields_detected or {}).items():
+            if field not in allowed_fields or value is None:
+                continue
+            cleaned = value.strip() if isinstance(value, str) else str(value).strip()
+            if not cleaned:
+                continue
+            answers[field] = cleaned
+            if field == "name" and not convo.get("contact_name"):
+                convo["contact_name"] = cleaned
+
+    missing_fields = _missing_fields(convo)
+    next_field = None
+    if result.next_field and result.next_field in missing_fields:
+        next_field = result.next_field
+    elif missing_fields:
+        next_field = missing_fields[0]
+
+    needs_handoff = bool(result.needs_human)
+    handoff_reason = result.handoff_reason
+
+    if intent in ESCALATION_INTENTS and not requires_clarification:
+        escalations = convo.setdefault("escalations", {})
+        count = escalations.get(intent, 0) + 1
+        escalations[intent] = count
+        if count >= ESCALATION_THRESHOLD and not needs_handoff:
+            needs_handoff = True
+            handoff_reason = handoff_reason or f"{intent}_insistent"
+    else:
+        convo.setdefault("escalations", {}).pop(intent, None)
+
+    if needs_handoff:
+        convo["status"] = "handoff"
+        convo["inactivity_paused"] = True
+        convo["awaiting_field"] = None
+        convo["handoff_reason"] = handoff_reason or intent
+        state[wa_id] = convo
+        _save_state(state)
+        await _announce_handoff(wa_id, convo, convo.get("handoff_reason"))
+        _score_lead_from_conversation(wa_id, convo)
+        return
+
+    reply_parts: List[str] = []
+    follow_field = None
+    reply_text = result.reply.strip() if result.reply else ""
+    if intent == "ask_portfolio" and PORTFOLIO_LINK not in reply_text:
+        portfolio_line = f"Here’s our latest work portfolio: {PORTFOLIO_LINK}"
+        reply_text = f"{reply_text}\n\n{portfolio_line}".strip() if reply_text else portfolio_line
+    if reply_text:
+        reply_parts.append(reply_text)
+
+    if requires_clarification:
+        clarify_field = convo.get("awaiting_field") or next_field
+        if clarify_field:
+            clarify_prompt = result.follow_up_prompt or _build_question_prompt(clarify_field, convo)
+        else:
+            clarify_prompt = result.follow_up_prompt or "Just to be sure, could you clarify that for me?"
+        if clarify_prompt:
+            reply_parts.append(clarify_prompt.strip())
+        follow_field = clarify_field
+    elif next_field:
+        follow_text = result.follow_up_prompt or _build_question_prompt(next_field, convo)
+        if follow_text:
+            reply_parts.append(follow_text.strip())
+            follow_field = next_field
+
+    message = "\n\n".join(part for part in reply_parts if part)
+
+    if message:
+        await _send_whatsapp_text(wa_id, message, preview_url=False)
+        _append_history(convo, "bot", message)
+        convo["has_welcomed"] = True
+    convo["awaiting_field"] = follow_field
+
+    should_offer_meeting = (result.request_meeting and not requires_clarification) or (not _missing_fields(convo) and not requires_clarification)
+    if should_offer_meeting and not convo.get("completed"):
+        await _send_meeting_prompt(wa_id, convo)
+        convo["completed"] = True
+        convo["status"] = "completed"
+    state[wa_id] = convo
+    _save_state(state)
+    _score_lead_from_conversation(wa_id, convo)
+
+
+async def _send_recap_prompt(wa_id: str, convo: Dict[str, Any], now_ts: float) -> None:
+    summary = _build_recap_summary(convo)
+    recap_text = (
+        f"Welcome back! {summary} Would you like to start a new project, make edits to the existing details, or continue from where we left off? "
+        "Just reply with 'new', 'edit', or 'continue'."
+    )
+    await _send_whatsapp_text(wa_id, recap_text, preview_url=False)
+    _append_history(convo, "bot", recap_text)
+    convo["awaiting_recap_choice"] = True
+    convo["has_recap_prompted"] = True
+    convo["last_recap_ts"] = now_ts
+
+
+async def _process_recap_choice(wa_id: str, convo: Dict[str, Any], incoming_text: str) -> bool:
+    if not convo.get("awaiting_recap_choice"):
+        return False
+    choice = _classify_recap_choice(incoming_text or "")
+    if not choice:
+        prompt = "Just let me know if you'd like to start a new project, edit the existing plan, or continue where we paused."
+        await _send_whatsapp_text(wa_id, prompt, preview_url=False)
+        _append_history(convo, "bot", prompt)
+        return True
+    now = datetime.now(timezone.utc)
+    convo["awaiting_recap_choice"] = False
+    convo["has_recap_prompted"] = True
+    convo["last_recap_ts"] = now.timestamp()
+
+    if choice == "new":
+        prev_answers = convo.get("answers", {})
+        if prev_answers:
+            convo.setdefault("previous_intakes", []).append(
+                {"answers": prev_answers, "archived_at": now.isoformat()}
+            )
+        convo["answers"] = {}
+        convo["completed"] = False
+        convo["status"] = "active"
+        convo["has_welcomed"] = False
+        convo["awaiting_field"] = None
+        next_field = _next_missing_field(convo) or "name"
+        prompt = _build_question_prompt(next_field, convo)
+        message = f"Fresh canvas — let’s capture this new project!\n\n{prompt}"
+        convo["awaiting_field"] = next_field
+        await _send_whatsapp_text(wa_id, message, preview_url=False)
+        _append_history(convo, "bot", message)
+        return True
+
+    if choice == "edit":
+        message = (
+            "Perfect—tell me what detail you’d like to tweak and I’ll update it. Feel free to say something like ‘Change budget to 30L’."
+        )
+        await _send_whatsapp_text(wa_id, message, preview_url=False)
+        _append_history(convo, "bot", message)
+        return True
+
+    next_field = _next_missing_field(convo)
+    if next_field:
+        prompt = _build_question_prompt(next_field, convo)
+        message = f"Great, let’s continue from where we paused.\n\n{prompt}"
+        convo["awaiting_field"] = next_field
+        await _send_whatsapp_text(wa_id, message, preview_url=False)
+        _append_history(convo, "bot", message)
+        return True
+    message = "We already have every detail saved. Let me resend the latest meeting slots."
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
+    _append_history(convo, "bot", message)
+    await _send_meeting_prompt(wa_id, convo)
+    convo["status"] = "completed"
+    convo["completed"] = True
+    return True
+
+
+async def _announce_handoff(wa_id: str, convo: Dict[str, Any], reason: str | None) -> None:
+    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+    client_msg = (
+        f"{name}, I want a designer to weigh in directly so you get a precise answer. I’m looping them in now—expect a human follow-up shortly."
+    )
+    await _send_whatsapp_text(wa_id, client_msg, preview_url=False)
+    _append_history(convo, "bot", client_msg)
+    if not ADMIN_ALERT_NUMBERS:
+        return
+    summary = (
+        f"Human takeover requested for {wa_id}. Reason: {reason or 'unspecified'}. Current answers: {json.dumps(convo.get('answers', {}), ensure_ascii=False)}"
+    )
+    for admin in ADMIN_ALERT_NUMBERS:
+        try:
+            await _send_whatsapp_text(admin, summary, preview_url=False)
+        except HTTPException as exc:
+            print(f"ADMIN ALERT SEND ERROR ({admin}): {exc.detail}")
+
+
+def _should_prompt_recap(convo: Dict[str, Any], now_ts: float) -> bool:
+    if not convo.get("history"):
+        return False
+    if convo.get("awaiting_recap_choice"):
+        return False
+    if convo.get("status") == "handoff":
+        return False
+    if not convo.get("has_recap_prompted"):
+        return True
+    last_recap = convo.get("last_recap_ts") or 0
+    return (now_ts - last_recap) >= RECAP_COOLDOWN_SECONDS
+
+
+def _build_recap_summary(convo: Dict[str, Any]) -> str:
+    answers = convo.get("answers", {})
+    snippets: List[str] = []
+    if answers.get("service_type"):
+        snippets.append(f"you were exploring {answers['service_type'].lower()} support")
+    if answers.get("project_type"):
+        snippets.append(f"for a {answers['project_type']}")
+    if answers.get("location"):
+        snippets.append(f"in {answers['location']}")
+    if answers.get("area"):
+        snippets.append(f"around {answers['area']}")
+    if answers.get("budget"):
+        snippets.append(f"with a budget of {answers['budget']}")
+    if answers.get("timeline"):
+        snippets.append(f"targeting {answers['timeline']}")
+    if answers.get("finish"):
+        snippets.append(f"preferring a {answers['finish']} finish")
+    if snippets:
+        return "We last noted " + ", ".join(snippets) + "."
+    return "We still have your earlier project details on file."
+
+
+def _classify_recap_choice(text: str) -> str | None:
+    normalized = text.lower().strip()
+    if not normalized:
+        return None
+    if "new" in normalized:
+        return "new"
+    if any(keyword in normalized for keyword in ["edit", "change", "tweak", "update"]):
+        return "edit"
+    if any(keyword in normalized for keyword in ["continue", "resume", "same", "carry on"]):
+        return "continue"
+    return None
 
 
 def _build_question_prompt(field: str, convo: Dict[str, Any]) -> str:
@@ -545,6 +877,10 @@ async def _send_meeting_prompt(wa_id: str, convo: Dict[str, Any]) -> None:
         f"Reply with the slot number that works best, and I’ll confirm it plus share the meeting link: {MEETING_LINK}"
     )
     await _send_whatsapp_text(wa_id, message, preview_url=True)
+    _append_history(convo, "bot", message)
+    offer = convo.setdefault("meeting_offer", {})
+    offer["sent_at"] = datetime.now(timezone.utc).isoformat()
+    offer["slots"] = slots
 
 
 async def _inactivity_watcher() -> None:
@@ -643,6 +979,38 @@ async def _process_meeting_reminders() -> None:
         _save_meetings(meetings)
 
 
+def _read_json_file(path: Path):
+    if not path.exists():
+        return None
+    try:
+        with path.open('r', encoding='utf-8') as fh:
+            return json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _append_history(convo: Dict[str, Any], speaker: str, text: str) -> None:
+    if not text:
+        return
+    entry = {"ts": datetime.now(timezone.utc).isoformat(), "from": speaker, "text": text.strip()}
+    history = convo.setdefault("history", [])
+    history.append(entry)
+    if len(history) > MAX_HISTORY_LENGTH:
+        del history[:-MAX_HISTORY_LENGTH]
+
+
+def _missing_fields(convo: Dict[str, Any]) -> List[str]:
+    answers = convo.get("answers", {})
+    missing: List[str] = []
+    for field in QUESTION_FLOW:
+        value = answers.get(field)
+        if field == "name" and (convo.get("contact_name") or value):
+            continue
+        if not value:
+            missing.append(field)
+    return missing
+
+
 def _generate_meeting_slots() -> List[str]:
     now = datetime.now(IST)
     slot_hours = [time(11, 0), time(15, 0), time(19, 0)]
@@ -664,13 +1032,14 @@ def _generate_meeting_slots() -> List[str]:
 
 
 def _load_state() -> Dict[str, Any]:
-    if not STATE_PATH.exists():
-        return {}
-    try:
-        with STATE_PATH.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except json.JSONDecodeError:
-        return {}
+    data = _read_json_file(STATE_PATH)
+    if data is not None:
+        return data
+    if _r2_download_to_path(STATE_R2_KEY, STATE_PATH):
+        restored = _read_json_file(STATE_PATH)
+        if restored is not None:
+            return restored
+    return {}
 
 
 def _save_state(state: Dict[str, Any]) -> None:
@@ -678,16 +1047,18 @@ def _save_state(state: Dict[str, Any]) -> None:
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(state, fh)
     tmp_path.replace(STATE_PATH)
+    _r2_upload_path(STATE_PATH, STATE_R2_KEY)
 
 
 def _load_lead_index() -> Dict[str, Any]:
-    if not LEAD_INDEX_PATH.exists():
-        return {}
-    try:
-        with LEAD_INDEX_PATH.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except json.JSONDecodeError:
-        return {}
+    data = _read_json_file(LEAD_INDEX_PATH)
+    if data is not None:
+        return data
+    if _r2_download_to_path(LEAD_INDEX_R2_KEY, LEAD_INDEX_PATH):
+        restored = _read_json_file(LEAD_INDEX_PATH)
+        if restored is not None:
+            return restored
+    return {}
 
 
 def _save_lead_index(data: Dict[str, Any]) -> None:
@@ -695,6 +1066,7 @@ def _save_lead_index(data: Dict[str, Any]) -> None:
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(data, fh)
     tmp_path.replace(LEAD_INDEX_PATH)
+    _r2_upload_path(LEAD_INDEX_PATH, LEAD_INDEX_R2_KEY)
 
 
 def _store_lead_index(details: Dict[str, Any]) -> None:
@@ -842,13 +1214,14 @@ def _sanitize_filename(filename: str) -> str:
 
 
 def _load_lead_scores() -> Dict[str, Any]:
-    if not LEAD_SCORE_PATH.exists():
-        return {}
-    try:
-        with LEAD_SCORE_PATH.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except json.JSONDecodeError:
-        return {}
+    data = _read_json_file(LEAD_SCORE_PATH)
+    if data is not None:
+        return data
+    if _r2_download_to_path(LEAD_SCORE_R2_KEY, LEAD_SCORE_PATH):
+        restored = _read_json_file(LEAD_SCORE_PATH)
+        if restored is not None:
+            return restored
+    return {}
 
 
 def _save_lead_scores(data: Dict[str, Any]) -> None:
@@ -856,6 +1229,7 @@ def _save_lead_scores(data: Dict[str, Any]) -> None:
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(data, fh)
     tmp_path.replace(LEAD_SCORE_PATH)
+    _r2_upload_path(LEAD_SCORE_PATH, LEAD_SCORE_R2_KEY)
 
 
 def _record_lead_score(key: str, result: Dict[str, Any]) -> None:
