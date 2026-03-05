@@ -640,20 +640,11 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     if reply_text:
         reply_parts.append(reply_text)
 
-    if requires_clarification and not skip_forced_follow:
-        clarify_field = convo.get("awaiting_field") or next_field
-        if clarify_field:
-            clarify_prompt = result.follow_up_prompt or _build_question_prompt(clarify_field, convo)
-        else:
-            clarify_prompt = result.follow_up_prompt or "Just to be sure, could you clarify that for me?"
-        if clarify_prompt:
-            reply_parts.append(clarify_prompt.strip())
-        follow_field = clarify_field
-    elif next_field and not skip_forced_follow:
-        follow_text = result.follow_up_prompt or _build_question_prompt(next_field, convo)
-        if follow_text:
-            reply_parts.append(follow_text.strip())
-            follow_field = next_field
+    if result.follow_up_prompt and not skip_forced_follow:
+        reply_parts.append(result.follow_up_prompt.strip())
+
+    if not skip_forced_follow and next_field:
+        follow_field = next_field
 
     message = "\n\n".join(part for part in reply_parts if part)
 

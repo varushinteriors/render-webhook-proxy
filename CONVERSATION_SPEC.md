@@ -76,6 +76,8 @@ The control layer now routes intents through dedicated handlers before the gener
 
 Only when no handler runs do we drop back to `_run_agent_flow`.
 
+If the model leaves `next_field` empty, the controller stays silent—we never synthesize a fallback prompt anymore.
+
 ## 4. Data Model Updates (`STATE_PATH`)
 ```json
 {
