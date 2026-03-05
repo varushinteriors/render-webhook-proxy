@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
-from openai.types import Response
 
 ALLOWED_INTENTS = [
     "new_info",
@@ -128,7 +127,7 @@ class ConversationAgent:
             f"New client message: {message.strip()}"
         )
         try:
-            response: Response = await self.client.responses.create(
+            response = await self.client.responses.create(
                 model=self.model,
                 input=[
                     {
@@ -167,7 +166,7 @@ class ConversationAgent:
         )
 
     @staticmethod
-    def _extract_text(response: Response) -> Optional[str]:
+    def _extract_text(response: Any) -> Optional[str]:
         for item in response.output or []:
             for content in getattr(item, "content", []) or []:
                 text = getattr(content, "text", None)
