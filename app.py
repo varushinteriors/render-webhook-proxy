@@ -370,6 +370,14 @@ async def admin_schedule_meeting(
     meeting = _register_meeting(body)
     return meeting
 
+@app.get("/status")
+async def service_status():
+    return {
+        "agent_ready": conversation_agent.is_ready,
+        "openai_key_loaded": bool(os.getenv("OPENAI_API_KEY")),
+        "intent_router": sorted(INTENT_ROUTER.keys()),
+    }
+
 
 async def _auto_reply(payload: Dict[str, Any]) -> None:
     entries = payload.get("entry", [])
