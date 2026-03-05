@@ -67,6 +67,15 @@ The LLM returns a JSON object like:
 ```
 4. **Validation + fallback.** If the LLM response is missing required keys or exceeds length, fall back to deterministic copy templates.
 
+### Intent router
+The control layer now routes intents through dedicated handlers before the generic flow runs. Example routing:
+- `ready_to_book` → jump straight to meeting slots
+- `pricing_query` → share high-level ranges + offer a short alignment call
+- `smalltalk` → acknowledge politely without logging answers
+- `objection` / `confusion` → send the reassurance copy (location + property type + approx size) before resuming
+
+Only when no handler runs do we drop back to `_run_agent_flow`.
+
 ## 4. Data Model Updates (`STATE_PATH`)
 ```json
 {
@@ -97,6 +106,7 @@ The LLM returns a JSON object like:
 - `history` enables the LLM to reason over previous Q&A without hitting external logs.
 - `edits` array (optional) tracks `{field, old_value, new_value, ts}` for audit.
 - `handoff_reason` when `status="handoff"` helps route to the right human.
+- `phase` tracks where we are in the journey (`discovery` → `qualification` → `value_build` → `booking` → `post_booking`).
 
 - `has_recap_prompted`, `awaiting_recap_choice`, and `last_recap_ts` drive the returning-client summary so we only ask “new vs edit vs continue” once per comeback (or after the cooldown).
 
@@ -136,5 +146,6 @@ The LLM returns a JSON object like:
 7. **Objection handling** – “Interior designers charge too much” → intent=`objection`, response references the guarantee + factory-to-project + in-house team, then resumes the intake.
 8. **Returning client recap** – Reconnect after a prior intake. Expect the recap summary + “new / edit / continue” prompt. Reply “new” (state resets), “edit” (stays in edit mode), and “continue” (jumps to next missing question).
 9. **Confusion flow** – “Why so many questions?” should trigger intent=`confusion`, give the short explainer (location + property + size), then ask just one follow-up.
+10. **Intent router sanity** – “Can you share pricing?” should hit the pricing handler (cost ranges + short-call invite) before any other question fires.
 
-This doc now mirrors the production conversation engine (Step 3). Keep it updated as we add re-engagement templates or new intents.
+This doc now mirrors the production conversation engine (Step 4). Keep it updated as we add re-engagement templates or new intents.

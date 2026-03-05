@@ -202,6 +202,12 @@ QUESTION_PROMPTS = {
 INTENTS_THAT_SKIP_FORCED_PROMPT = {"smalltalk", "objection", "confusion"}
 GENTLE_RECOVERY_FIELDS = ["location", "project_type", "area"]
 
+PHASE_DISCOVERY = "discovery"
+PHASE_QUALIFICATION = "qualification"
+PHASE_VALUE_BUILD = "value_build"
+PHASE_BOOKING = "booking"
+PHASE_POST_BOOKING = "post_booking"
+
 MAX_HISTORY_LENGTH = 40
 ESCALATION_INTENTS = {"pricing_query"}
 ESCALATION_THRESHOLD = 2
@@ -450,6 +456,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         "has_recap_prompted": False,
         "awaiting_recap_choice": False,
         "last_recap_ts": 0.0,
+        "phase": PHASE_DISCOVERY,
     })
     convo.setdefault("answers", {})
     convo.setdefault("history", [])
@@ -458,6 +465,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     convo.setdefault("has_recap_prompted", False)
     convo.setdefault("awaiting_recap_choice", False)
     convo.setdefault("last_recap_ts", 0.0)
+    convo.setdefault("phase", PHASE_DISCOVERY)
 
     previous_last_ts = convo.get("last_client_ts")
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -532,6 +540,15 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         await _run_legacy_flow(wa_id, convo, state)
         return
 
+    handler = INTENT_ROUTER.get(agent_result.intent)
+    if handler:
+        handled = await handler(wa_id, convo)
+        if handled:
+            state[wa_id] = convo
+            _save_state(state)
+            _score_lead_from_conversation(wa_id, convo)
+            return
+
     await _run_agent_flow(wa_id, convo, state, agent_result)
 
 
@@ -586,8 +603,6 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     next_field = None
     if result.next_field and result.next_field in missing_fields:
         next_field = result.next_field
-    elif missing_fields:
-        next_field = missing_fields[0]
 
     needs_handoff = bool(result.needs_human)
     handoff_reason = result.handoff_reason
@@ -618,21 +633,10 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
 
     reply_parts: List[str] = []
     follow_field = None
-    fallback_follow_field = None
     reply_text = result.reply.strip() if result.reply else ""
     if intent == "ask_portfolio" and PORTFOLIO_LINK not in reply_text:
         portfolio_line = f"Here’s our latest work portfolio: {PORTFOLIO_LINK}"
         reply_text = f"{reply_text}\n\n{portfolio_line}".strip() if reply_text else portfolio_line
-    if intent in {"objection", "confusion"} and not reply_text:
-        explainer = (
-            "Totally fair! I only ask a couple of quick details so our designer can share precise ideas instead of generic advice."
-            "\n\nUsually we just note the location, property type, and approximate size."
-        )
-        gentle_field = next((field for field in GENTLE_RECOVERY_FIELDS if not convo.get("answers", {}).get(field)), None)
-        if gentle_field:
-            explainer = f"{explainer}\n\n{_build_question_prompt(gentle_field, convo)}"
-            fallback_follow_field = gentle_field
-        reply_text = explainer
     if reply_text:
         reply_parts.append(reply_text)
 
@@ -657,8 +661,6 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
         await _send_whatsapp_text(wa_id, message, preview_url=False)
         _append_history(convo, "bot", message)
         convo["has_welcomed"] = True
-    if not follow_field and fallback_follow_field:
-        follow_field = fallback_follow_field
     convo["awaiting_field"] = follow_field
 
     should_offer_meeting = (result.request_meeting and not requires_clarification) or (not _missing_fields(convo) and not requires_clarification)
@@ -666,6 +668,7 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
         await _send_meeting_prompt(wa_id, convo)
         convo["completed"] = True
         convo["status"] = "completed"
+    _update_convo_phase(convo)
     state[wa_id] = convo
     _save_state(state)
     _score_lead_from_conversation(wa_id, convo)
@@ -813,6 +816,31 @@ def _build_question_prompt(field: str, convo: Dict[str, Any]) -> str:
     name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
     template = QUESTION_PROMPTS.get(field, "Could you share more details?")
     return template.format(name=name)
+
+
+def _convo_display_name(convo: Dict[str, Any]) -> str:
+    return convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+
+
+def _build_gentle_project_prompt(convo: Dict[str, Any]) -> tuple[str | None, str | None]:
+    answers = convo.get("answers", {})
+    for field in GENTLE_RECOVERY_FIELDS:
+        if not answers.get(field):
+            return _build_question_prompt(field, convo), field
+    return None, None
+
+
+def _update_convo_phase(convo: Dict[str, Any]) -> str:
+    phase = convo.get("phase") or PHASE_DISCOVERY
+    answers = convo.get("answers", {})
+    if phase == PHASE_DISCOVERY and all(answers.get(field) for field in GENTLE_RECOVERY_FIELDS):
+        phase = PHASE_QUALIFICATION
+    if phase == PHASE_QUALIFICATION and answers.get("budget") and answers.get("timeline"):
+        phase = PHASE_VALUE_BUILD
+    if convo.get("completed") and phase in {PHASE_DISCOVERY, PHASE_QUALIFICATION, PHASE_VALUE_BUILD}:
+        phase = PHASE_BOOKING
+    convo["phase"] = phase
+    return phase
 
 
 def _build_followup_ack(convo: Dict[str, Any]) -> str:
@@ -1524,3 +1552,65 @@ async def _send_whatsapp_text(to: str, message: str, preview_url: bool) -> Dict[
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
+
+
+async def _intent_ready_to_book(wa_id: str, convo: Dict[str, Any]) -> bool:
+    await _send_meeting_prompt(wa_id, convo)
+    convo["completed"] = True
+    convo["status"] = "completed"
+    _update_convo_phase(convo)
+    return True
+
+
+async def _intent_pricing_query(wa_id: str, convo: Dict[str, Any]) -> bool:
+    name = _convo_display_name(convo)
+    message = (
+        f"Great question, {name}! Budgets flex with finishes and scale, but premium 3BHK design-build packages typically start ~₹15–20L when we handle design + execution end-to-end. Share whatever’s top of mind and we’ll tailor a tighter range or hop on a 10-min alignment call."
+    )
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
+    _append_history(convo, "bot", message)
+    return True
+
+
+async def _intent_smalltalk(wa_id: str, convo: Dict[str, Any]) -> bool:
+    name = _convo_display_name(convo)
+    message = (
+        f"Hey {name}! I’m right here whenever you want to dive in—share whichever detail is easiest and I’ll take it from there."
+    )
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
+    _append_history(convo, "bot", message)
+    return True
+
+
+async def _intent_objection(wa_id: str, convo: Dict[str, Any]) -> bool:
+    return await _send_gentle_reassurance(wa_id, convo)
+
+
+async def _intent_confusion(wa_id: str, convo: Dict[str, Any]) -> bool:
+    return await _send_gentle_reassurance(wa_id, convo)
+
+
+async def _send_gentle_reassurance(wa_id: str, convo: Dict[str, Any]) -> bool:
+    name = _convo_display_name(convo)
+    explainer = (
+        f"Makes sense, {name}! I only ask a couple of quick details so our lead designer can share precise ideas instead of generic advice.\n\n"
+        "Usually we just note the location, property type, and approximate size, then tailor everything from there."
+    )
+    gentle_prompt, follow_field = _build_gentle_project_prompt(convo)
+    if gentle_prompt:
+        explainer = f"{explainer}\n\n{gentle_prompt}"
+        convo["awaiting_field"] = follow_field
+    await _send_whatsapp_text(wa_id, explainer, preview_url=False)
+    _append_history(convo, "bot", explainer)
+    return True
+
+
+INTENT_ROUTER = {
+    "ready_to_book": _intent_ready_to_book,
+    "pricing_query": _intent_pricing_query,
+    "smalltalk": _intent_smalltalk,
+    "objection": _intent_objection,
+    "confusion": _intent_confusion,
+}
+
+
