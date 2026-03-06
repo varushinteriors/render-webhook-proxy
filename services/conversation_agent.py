@@ -146,11 +146,11 @@ class ConversationAgent:
                 input=[
                     {
                         "role": "system",
-                        "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+                        "content": [{"type": "input_text", "text": SYSTEM_PROMPT}],
                     },
                     {
                         "role": "user",
-                        "content": [{"type": "text", "text": user_prompt}],
+                        "content": [{"type": "input_text", "text": user_prompt}],
                     },
                 ],
             )
