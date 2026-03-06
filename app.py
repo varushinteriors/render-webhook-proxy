@@ -13,6 +13,8 @@ import httpx
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, Request, Response, HTTPException, Query, Header
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 from pydantic import BaseModel
 
 from agents.lead_scoring import LeadInput, LeadScoringAgent
@@ -72,6 +74,10 @@ STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
 MEET_LINK_TEMPLATE = os.getenv("MEET_LINK_TEMPLATE", MEETING_LINK)
 IST = ZoneInfo("Asia/Kolkata")
+GOOGLE_CALENDAR_CREDENTIALS_JSON = os.getenv("GOOGLE_CALENDAR_CREDENTIALS_JSON") or os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "").strip()
+CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+_CALENDAR_SERVICE = None
 def _parse_date_list(raw: str) -> Set[date]:
     results: Set[date] = set()
     for value in raw.split(","):
@@ -94,6 +100,90 @@ def _build_meet_link(meeting_id: str) -> str:
         separator = "&" if "?" in template else "?"
         return f"{template}{separator}id={token}"
     return f"https://meet.google.com/lookup/varush-{token}"
+
+
+def _get_calendar_service():
+    global _CALENDAR_SERVICE
+    if _CALENDAR_SERVICE is not None:
+        return _CALENDAR_SERVICE
+    if not (GOOGLE_CALENDAR_CREDENTIALS_JSON and GOOGLE_CALENDAR_ID):
+        return None
+    try:
+        info = json.loads(GOOGLE_CALENDAR_CREDENTIALS_JSON)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=CALENDAR_SCOPES)
+        _CALENDAR_SERVICE = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        print(f"CALENDAR INIT ERROR: {exc}")
+        _CALENDAR_SERVICE = None
+    return _CALENDAR_SERVICE
+
+
+def _create_calendar_event(record: Dict[str, Any], slot_dt: datetime, client_name: str | None) -> str | None:
+    service = _get_calendar_service()
+    if not service:
+        return None
+    end_dt = slot_dt + timedelta(minutes=MEETING_SLOT_MINUTES)
+    name = client_name or record.get("wa_id")
+    body = {
+        "summary": f"Varush design chat – {name}",
+        "description": f"WhatsApp: +{record.get('wa_id')}",
+        "start": {"dateTime": slot_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
+        "end": {"dateTime": end_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
+        "conferenceData": {
+            "createRequest": {
+                "requestId": record["id"],
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        },
+    }
+    try:
+        event = (
+            service.events()
+            .insert(calendarId=GOOGLE_CALENDAR_ID, body=body, conferenceDataVersion=1)
+            .execute()
+        )
+        record["google_event_id"] = event.get("id")
+        return event.get("hangoutLink")
+    except Exception as exc:
+        print(f"CALENDAR EVENT CREATE ERROR: {exc}")
+        return None
+
+
+def _update_calendar_event(record: Dict[str, Any], slot_dt: datetime) -> None:
+    service = _get_calendar_service()
+    event_id = record.get("google_event_id")
+    if not (service and event_id):
+        return
+    end_dt = slot_dt + timedelta(minutes=MEETING_SLOT_MINUTES)
+    body = {
+        "start": {"dateTime": slot_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
+        "end": {"dateTime": end_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
+    }
+    try:
+        event = (
+            service.events()
+            .patch(
+                calendarId=GOOGLE_CALENDAR_ID,
+                eventId=event_id,
+                body=body,
+                conferenceDataVersion=1,
+            )
+            .execute()
+        )
+        record["meet_link"] = event.get("hangoutLink") or record.get("meet_link")
+    except Exception as exc:
+        print(f"CALENDAR EVENT UPDATE ERROR: {exc}")
+
+
+def _delete_calendar_event(record: Dict[str, Any]) -> None:
+    service = _get_calendar_service()
+    event_id = record.get("google_event_id")
+    if not (service and event_id):
+        return
+    try:
+        service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+    except Exception as exc:
+        print(f"CALENDAR EVENT DELETE ERROR: {exc}")
 
 
 TEST_WA_IDS = {
@@ -911,7 +1001,7 @@ async def _admin_book_command(admin_wa: str, parts: List[str], state: Dict[str, 
         await _send_whatsapp_text(admin_wa, "Pick a slot within working hours (11:30 AM–4:50 PM IST, weekdays only).", preview_url=False)
         return True
     extra_fields, note = _parse_admin_fields(parts[4:])
-    success, record_or_error = _create_meeting_record(client_wa, slot_dt, note, admin_wa)
+    success, record_or_error = _create_meeting_record(client_wa, slot_dt, note, admin_wa, extra_fields.get("name"))
     if not success:
         await _send_whatsapp_text(admin_wa, record_or_error, preview_url=False)
         return True
@@ -1043,7 +1133,13 @@ def _apply_admin_fields(state: Dict[str, Any], client_wa: str, fields: Dict[str,
     return convo
 
 
-def _create_meeting_record(client_wa: str, slot_dt: datetime, note: str | None, admin_wa: str | None) -> tuple[bool, str | Dict[str, Any]]:
+def _create_meeting_record(
+    client_wa: str,
+    slot_dt: datetime,
+    note: str | None,
+    admin_wa: str | None,
+    client_name: str | None = None,
+) -> tuple[bool, str | Dict[str, Any]]:
     slot_utc = slot_dt.astimezone(timezone.utc)
     meetings = _load_meetings()
     if _slot_conflicts(slot_utc, meetings):
@@ -1060,6 +1156,9 @@ def _create_meeting_record(client_wa: str, slot_dt: datetime, note: str | None, 
         "created_by": admin_wa or "auto",
         "meet_link": _build_meet_link(meeting_id),
     }
+    calendar_link = _create_calendar_event(record, slot_dt, client_name)
+    if calendar_link:
+        record["meet_link"] = calendar_link
     meetings.append(record)
     _save_meetings(meetings)
     return True, record
@@ -1090,6 +1189,7 @@ def _reschedule_existing_meeting(client_wa: str, slot_dt: datetime, admin_wa: st
     })
     target["scheduled_at"] = slot_utc.isoformat()
     target["note"] = note or target.get("note")
+    _update_calendar_event(target, slot_dt)
     _save_meetings(meetings)
     label = slot_dt.strftime("%a, %d %b · %I:%M %p IST")
     return True, f"Rescheduled to {label}.", target
@@ -1104,6 +1204,7 @@ def _cancel_existing_meeting(client_wa: str, reason: str, admin_wa: str) -> tupl
     target["cancelled_at"] = datetime.now(timezone.utc).isoformat()
     target["cancelled_by"] = admin_wa
     target["cancellation_reason"] = reason
+    _delete_calendar_event(target)
     _save_meetings(meetings)
     return True, "Meeting cancelled."
 
