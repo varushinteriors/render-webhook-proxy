@@ -235,6 +235,9 @@ OBJECTION_PHRASES = [
     "you keep on",
     "stop asking",
     "not interested",
+    "i am asking you",
+    "are you not",
+    "intelligent enough",
 ]
 
 AREA_UNKNOWN_PHRASES = [
