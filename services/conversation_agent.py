@@ -111,6 +111,7 @@ class ConversationAgent:
         message: str,
         contact_name: Optional[str],
         portfolio_link: str,
+        phase: Optional[str],
     ) -> Optional[ConversationAgentResult]:
         if not self.client:
             return None
@@ -120,16 +121,24 @@ class ConversationAgent:
         awaiting_text = awaiting_field or "none"
         name = contact_name or "there"
         smalltalk_hint = ", ".join(SMALLTALK_KEYWORDS)
+        phase_text = phase or "discovery"
         user_prompt = (
             f"Client name: {name}\n"
             f"Known answers JSON: {answers_text}\n"
             f"Missing fields (in order): {missing_text}\n"
             f"Awaiting specific field: {awaiting_text}\n"
+            f"Current phase: {phase_text}\n"
             f"Portfolio link: {portfolio_link}\n"
             f"Treat these keywords as pure smalltalk: {smalltalk_hint}.\n"
             f"Recent history (newest last):\n{history_text}\n\n"
             f"New client message: {message.strip()}"
         )
+        print("LLM CALL STARTED")
+        print(f"LLM USER MESSAGE: {message.strip()}")
+        print(f"LLM KNOWN ANSWERS: {answers_text}")
+        print(f"LLM MISSING FIELDS: {missing_text}")
+        print(f"LLM AWAITING FIELD: {awaiting_text}")
+        print(f"LLM PHASE: {phase_text}")
         try:
             response = await self.client.responses.create(
                 model=self.model,
@@ -145,15 +154,18 @@ class ConversationAgent:
                 ],
                 response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
             )
+            print("LLM RESPONSE RECEIVED")
         except Exception as exc:  # pylint: disable=broad-except
             print(f"LLM ERROR: {exc}")
             return None
 
         content = self._extract_text(response)
+        print(f"LLM CONTENT: {content}")
         if not content:
             return None
         try:
             data = json.loads(content)
+            print(f"LLM PARSED RESULT: {data}")
         except json.JSONDecodeError:
             print("LLM JSON DECODE ERROR:", content)
             return None

@@ -179,9 +179,9 @@ QUESTION_FLOW = [
     "location",
     "project_type",
     "area",
+    "budget",
     "timeline",
     "finish",
-    "budget",
     "assets",
     "portfolio",
 ]
@@ -199,8 +199,176 @@ QUESTION_PROMPTS = {
     "portfolio": f"Would you like to see our latest work portfolio? Here’s a quick look: {PORTFOLIO_LINK}",
 }
 
+CHATTER_RESPONSES = {
+    "hi",
+    "hello",
+    "hey",
+    "hii",
+    "hiii",
+    "hlo",
+    "hola",
+    "ok",
+    "okay",
+    "k",
+    "kk",
+    "h",
+    "hmm",
+    "hmmm",
+    "yo",
+    "sup",
+}
+
+OBJECTION_PHRASES = [
+    "why so many",
+    "are you mad",
+    "you are just a bot",
+    "you are just a",
+    "without listening",
+    "without application",
+    "what's the point",
+    "whats the point",
+    "pls understand",
+    "please understand",
+    "i don't want",
+    "i dont want",
+    "where were we",
+    "you keep on",
+    "stop asking",
+    "not interested",
+]
+
+AREA_UNKNOWN_PHRASES = [
+    "don't know",
+    "dont know",
+    "not sure",
+    "no idea",
+    "tbd",
+    "na",
+]
+
+SERVICE_TYPE_KEYWORDS = [
+    "interior",
+    "architect",
+    "turnkey",
+    "design",
+    "designer",
+    "renovation",
+    "execution",
+    "furniture",
+]
+
+FINISH_KEYWORDS = [
+    "budget",
+    "premium",
+    "luxury",
+    "mid",
+    "classic",
+    "bespoke",
+    "custom",
+]
+
+TIMELINE_KEYWORDS = [
+    "immed",
+    "month",
+    "week",
+    "day",
+    "soon",
+    "later",
+    "within",
+    "after",
+    "asap",
+    "next",
+    "now",
+    "quarter",
+]
+
+BUDGET_FLEXIBLE_RESPONSES = {
+    "flexible",
+    "no idea",
+    "not sure",
+    "tbd",
+    "depends",
+    "depend",
+    "open",
+    "as per design",
+}
+
+YES_NO_RESPONSES = {
+    "yes",
+    "y",
+    "yeah",
+    "yup",
+    "sure",
+    "of course",
+    "no",
+    "n",
+    "nah",
+    "nope",
+    "not yet",
+}
+
 INTENTS_THAT_SKIP_FORCED_PROMPT = {"smalltalk", "objection", "confusion"}
 GENTLE_RECOVERY_FIELDS = ["location", "project_type", "area"]
+
+
+def _normalize_text(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def _looks_like_objection(value: str) -> bool:
+    text = value.lower()
+    if text in CHATTER_RESPONSES:
+        return True
+    if any(phrase in text for phrase in OBJECTION_PHRASES):
+        return True
+    if text.count("?") >= 2:
+        return True
+    return False
+
+
+def _is_valid_field_value(field: str, value: str | None) -> bool:
+    text = _normalize_text(value)
+    if not text:
+        return False
+    lower = text.lower()
+    if lower in CHATTER_RESPONSES:
+        return False
+    if _looks_like_objection(lower):
+        return False
+
+    if field == "area":
+        if any(keyword in lower for keyword in AREA_UNKNOWN_PHRASES):
+            return True
+        return any(ch.isdigit() for ch in lower)
+    if field == "timeline":
+        return any(keyword in lower for keyword in TIMELINE_KEYWORDS)
+    if field == "finish":
+        return any(keyword in lower for keyword in FINISH_KEYWORDS)
+    if field == "budget":
+        if any(keyword in lower for keyword in BUDGET_FLEXIBLE_RESPONSES):
+            return True
+        return any(ch.isdigit() for ch in lower)
+    if field == "service_type":
+        return any(keyword in lower for keyword in SERVICE_TYPE_KEYWORDS)
+    if field in {"assets", "portfolio"}:
+        if lower in YES_NO_RESPONSES:
+            return True
+        return not _looks_like_objection(lower)
+    if field == "project_type":
+        if any(keyword in lower for keyword in ["bhk", "villa", "office", "farm", "floor", "flat", "house", "bungalow"]):
+            return True
+        return len(lower) >= 3 and not _looks_like_objection(lower)
+    if field == "location":
+        return len(lower) >= 3
+    return len(lower) >= 2
+
+
+def _sanitize_answers(convo: Dict[str, Any]) -> None:
+    answers = convo.get("answers") or {}
+    to_remove = [field for field, value in answers.items() if not _is_valid_field_value(field, value)]
+    for field in to_remove:
+        answers.pop(field, None)
+
 
 PHASE_DISCOVERY = "discovery"
 PHASE_QUALIFICATION = "qualification"
@@ -477,6 +645,8 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     convo.setdefault("phase", PHASE_DISCOVERY)
     convo.setdefault("awaiting_origin", None)
 
+    _sanitize_answers(convo)
+
     previous_last_ts = convo.get("last_client_ts")
     now_ts = datetime.now(timezone.utc).timestamp()
     convo["last_client_ts"] = now_ts
@@ -506,11 +676,18 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         and (awaiting_origin == "legacy" or (awaiting_origin is None and not conversation_agent.is_ready))
     )
     if should_force_capture:
-        convo["answers"][awaiting_field] = incoming_text
-        if awaiting_field == "name" and not convo.get("contact_name"):
-            convo["contact_name"] = incoming_text
+        cleaned_value = _normalize_text(incoming_text)
+        captured = False
+        if _is_valid_field_value(awaiting_field, cleaned_value):
+            convo["answers"][awaiting_field] = cleaned_value
+            captured = True
+            if awaiting_field == "name" and not convo.get("contact_name"):
+                convo["contact_name"] = cleaned_value
         convo["awaiting_field"] = None
         convo["awaiting_origin"] = None
+        if not captured:
+            answers = convo.setdefault("answers", {})
+            answers.pop(awaiting_field, None)
 
     _hydrate_state_from_lead(wa_id, convo)
 
@@ -551,6 +728,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         message=incoming_text,
         contact_name=convo.get("contact_name"),
         portfolio_link=PORTFOLIO_LINK,
+        phase=convo.get("phase"),
     )
 
     if not agent_result:
@@ -614,6 +792,8 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
             cleaned = value.strip() if isinstance(value, str) else str(value).strip()
             if not cleaned:
                 continue
+            if not _is_valid_field_value(field, cleaned):
+                continue
             answers[field] = cleaned
             if field == "name" and not convo.get("contact_name"):
                 convo["contact_name"] = cleaned
@@ -660,11 +840,11 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     if reply_text:
         reply_parts.append(reply_text)
 
-    if result.follow_up_prompt and not skip_forced_follow:
-        reply_parts.append(result.follow_up_prompt.strip())
-
-    if not skip_forced_follow and next_field:
-        follow_field = next_field
+    follow_up_prompt = result.follow_up_prompt.strip() if result.follow_up_prompt else None
+    if follow_up_prompt and not skip_forced_follow:
+        reply_parts.append(follow_up_prompt)
+        if next_field:
+            follow_field = next_field
 
     message = "\n\n".join(part for part in reply_parts if part)
 
@@ -848,12 +1028,14 @@ def _build_gentle_project_prompt(convo: Dict[str, Any]) -> tuple[str | None, str
 def _update_convo_phase(convo: Dict[str, Any]) -> str:
     phase = convo.get("phase") or PHASE_DISCOVERY
     answers = convo.get("answers", {})
-    if phase == PHASE_DISCOVERY and all(answers.get(field) for field in GENTLE_RECOVERY_FIELDS):
+    if answers.get("service_type") and answers.get("location"):
         phase = PHASE_QUALIFICATION
-    if phase == PHASE_QUALIFICATION and answers.get("budget") and answers.get("timeline"):
+    if phase in {PHASE_DISCOVERY, PHASE_QUALIFICATION} and answers.get("project_type") and answers.get("area"):
         phase = PHASE_VALUE_BUILD
-    if convo.get("completed") and phase in {PHASE_DISCOVERY, PHASE_QUALIFICATION, PHASE_VALUE_BUILD}:
+    if phase in {PHASE_DISCOVERY, PHASE_QUALIFICATION, PHASE_VALUE_BUILD} and answers.get("budget") and answers.get("timeline"):
         phase = PHASE_BOOKING
+    if convo.get("completed"):
+        phase = PHASE_POST_BOOKING
     convo["phase"] = phase
     return phase
 
