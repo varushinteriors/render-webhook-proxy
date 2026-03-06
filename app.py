@@ -220,6 +220,7 @@ CHATTER_RESPONSES = {
 
 OBJECTION_PHRASES = [
     "why so many",
+    "why do you ask so many",
     "are you mad",
     "you are just a bot",
     "you are just a",
