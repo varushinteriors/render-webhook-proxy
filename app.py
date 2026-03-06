@@ -3,7 +3,7 @@ import json
 import mimetypes
 import os
 from collections import deque
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
@@ -78,6 +78,29 @@ TEST_WA_IDS = {
     ).split(",")
     if wa.strip()
 }
+ADMIN_WA_IDS = {
+    wa.strip()
+    for wa in os.getenv("ADMIN_WA_IDS", "").split(",")
+    if wa.strip()
+}
+HOLIDAY_DATES = {
+    date.fromisoformat(value.strip())
+    for value in os.getenv("HOLIDAY_DATES", "").split(",")
+    if value.strip()
+}
+FIXED_HOLIDAY_MM_DD = {
+    "01-01",  # New Year
+    "01-26",  # Republic Day
+    "08-15",  # Independence Day
+    "10-02",  # Gandhi Jayanti
+    "12-25",  # Christmas
+}
+MEETING_SLOT_MINUTES = 10
+MEETING_PREP_BUFFER_MINUTES = 30
+MEETING_POST_BUFFER_MINUTES = 30
+MEETING_LOOKAHEAD_DAYS = 21
+MEETING_DAY_START = time(11, 0)
+MEETING_DAY_END = time(17, 30)
 
 scoring_agent = LeadScoringAgent()
 conversation_agent = ConversationAgent()
@@ -1196,13 +1219,18 @@ def _phone_key_from_wa(wa_id: str) -> str | None:
 async def _send_meeting_prompt(wa_id: str, convo: Dict[str, Any]) -> None:
     name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
     slots = _generate_meeting_slots()
-    slot_lines = [f"{i+1}. {slot}" for i, slot in enumerate(slots)]
-    slot_text = "\n".join(slot_lines)
-    message = (
-        f"Thanks, {name}! I have all the essentials. Let’s schedule a complimentary 10-min session with our designer.\n"
-        f"Here are the next available slots:\n{slot_text}\n\n"
-        f"Reply with the slot number that works best, and I’ll confirm it plus share the meeting link: {MEETING_LINK}"
-    )
+    if slots:
+        slot_lines = [f"{i+1}. {slot['label']}" for i, slot in enumerate(slots)]
+        slot_text = "\n".join(slot_lines)
+        message = (
+            f"Thanks, {name}! I have all the essentials. Let’s schedule a complimentary 10-min session with our designer.\n"
+            f"Here are the next available slots:\n{slot_text}\n\n"
+            f"Reply with the slot number that works best, and I’ll confirm it plus share the meeting link."
+        )
+    else:
+        message = (
+            f"Thanks, {name}! We’re fully booked in the next few days. Share a date/time that suits you and I’ll check with the team right away."
+        )
     await _send_whatsapp_text(wa_id, message, preview_url=True)
     _append_history(convo, "bot", message)
     offer = convo.setdefault("meeting_offer", {})
@@ -1338,23 +1366,75 @@ def _missing_fields(convo: Dict[str, Any]) -> List[str]:
     return missing
 
 
-def _generate_meeting_slots() -> List[str]:
+def _is_blocked_date(day: date) -> bool:
+    if day.weekday() == 6:  # Sunday
+        return True
+    if day.strftime("%m-%d") in FIXED_HOLIDAY_MM_DD:
+        return True
+    if day in HOLIDAY_DATES:
+        return True
+    return False
+
+
+def _generate_day_slots(day: date) -> List[datetime]:
+    if _is_blocked_date(day):
+        return []
+    start_dt = datetime.combine(day, MEETING_DAY_START, tzinfo=IST) + timedelta(minutes=MEETING_PREP_BUFFER_MINUTES)
+    end_dt = datetime.combine(day, MEETING_DAY_END, tzinfo=IST)
+    block_minutes = MEETING_SLOT_MINUTES + MEETING_PREP_BUFFER_MINUTES + MEETING_POST_BUFFER_MINUTES
+    wrap_minutes = MEETING_SLOT_MINUTES + MEETING_POST_BUFFER_MINUTES
+    slots: List[datetime] = []
+    slot_dt = start_dt
+    while slot_dt + timedelta(minutes=wrap_minutes) <= end_dt:
+        slots.append(slot_dt)
+        slot_dt += timedelta(minutes=block_minutes)
+    return slots
+
+
+def _slot_conflicts(slot_dt_utc: datetime, meetings: List[Dict[str, Any]]) -> bool:
+    block_start = slot_dt_utc - timedelta(minutes=MEETING_PREP_BUFFER_MINUTES)
+    block_end = slot_dt_utc + timedelta(minutes=MEETING_SLOT_MINUTES + MEETING_POST_BUFFER_MINUTES)
+    for meeting in meetings:
+        if meeting.get("status") != "scheduled":
+            continue
+        scheduled_at = _parse_meeting_time(meeting.get("scheduled_at"))
+        if not scheduled_at:
+            continue
+        meeting_start = scheduled_at - timedelta(minutes=MEETING_PREP_BUFFER_MINUTES)
+        meeting_end = scheduled_at + timedelta(minutes=MEETING_SLOT_MINUTES + MEETING_POST_BUFFER_MINUTES)
+        if block_start < meeting_end and block_end > meeting_start:
+            return True
+    return False
+
+
+def _list_available_slot_datetimes(count: int) -> List[datetime]:
+    meetings = _load_meetings()
     now = datetime.now(IST)
-    slot_hours = [time(11, 0), time(15, 0), time(19, 0)]
-    slots: List[str] = []
-    day_offset = 0
-    while len(slots) < 3 and day_offset < 5:
+    slots: List[datetime] = []
+    for day_offset in range(MEETING_LOOKAHEAD_DAYS):
         day = (now + timedelta(days=day_offset)).date()
-        for slot_time in slot_hours:
-            slot_dt = datetime.combine(day, slot_time, tzinfo=IST)
+        for slot_dt in _generate_day_slots(day):
             if slot_dt <= now:
                 continue
-            slots.append(slot_dt.strftime("%a, %d %b · %I:%M %p IST"))
-            if len(slots) >= 3:
-                break
-        day_offset += 1
-    if not slots:
-        slots.append("Please suggest a time that suits you.")
+            slot_dt_utc = slot_dt.astimezone(timezone.utc)
+            if _slot_conflicts(slot_dt_utc, meetings):
+                continue
+            slots.append(slot_dt)
+            if len(slots) >= count:
+                return slots
+    return slots
+
+
+def _generate_meeting_slots() -> List[Dict[str, str]]:
+    slot_dts = _list_available_slot_datetimes(5)
+    slots: List[Dict[str, str]] = []
+    for slot_dt in slot_dts:
+        slots.append(
+            {
+                "label": slot_dt.strftime("%a, %d %b · %I:%M %p IST"),
+                "start": slot_dt.astimezone(timezone.utc).isoformat(),
+            }
+        )
     return slots
 
 
