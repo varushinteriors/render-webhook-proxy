@@ -70,6 +70,14 @@ STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
 IST = ZoneInfo("Asia/Kolkata")
+TEST_WA_IDS = {
+    wa.strip()
+    for wa in os.getenv(
+        "TEST_WA_IDS",
+        "919873607248,918570073000,918814000400",
+    ).split(",")
+    if wa.strip()
+}
 
 scoring_agent = LeadScoringAgent()
 conversation_agent = ConversationAgent()
@@ -171,6 +179,10 @@ def _r2_upload_path(path: Path, key: str | None) -> None:
         r2_client.upload_file(str(path), R2_BUCKET, key, ExtraArgs={"ContentType": "application/json"})
     except (BotoCoreError, ClientError) as exc:
         print(f"R2 STATE UPLOAD ERROR ({key}): {exc}")
+
+
+def _is_test_wa(wa_id: str | None) -> bool:
+    return bool(wa_id and wa_id in TEST_WA_IDS)
 
 
 QUESTION_FLOW = [
@@ -648,6 +660,8 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     convo.setdefault("last_recap_ts", 0.0)
     convo.setdefault("phase", PHASE_DISCOVERY)
     convo.setdefault("awaiting_origin", None)
+    if _is_test_wa(wa_id):
+        convo["is_test"] = True
 
     _sanitize_answers(convo)
 
@@ -1367,6 +1381,8 @@ def _score_lead_from_canonical(details: Dict[str, Any]) -> None:
 
 
 def _score_lead_from_conversation(wa_id: str, convo: Dict[str, Any]) -> None:
+    if _is_test_wa(wa_id):
+        return
     key = _phone_key_from_wa(wa_id)
     index = _load_lead_index()
     canonical = index.get(key, {}).get("canonical", {}) if key else {}
