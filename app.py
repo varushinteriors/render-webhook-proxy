@@ -404,6 +404,18 @@ BUNDLE_FIELD_LABELS = {
     "timeline": "Planned start timeline (immediate, 3 months, 6 months, etc.)",
     "finish": "Preferred finish (budget, premium, luxury)",
 }
+SUMMARY_FIELDS = BUNDLE_FIELD_ORDER + ["assets", "portfolio"]
+SUMMARY_FIELD_LABELS = {
+    "service_type": "Service",
+    "location": "Location",
+    "project_type": "Property",
+    "area": "Area",
+    "budget": "Budget",
+    "timeline": "Timeline",
+    "finish": "Finish",
+    "assets": "Layouts/photos",
+    "portfolio": "Portfolio shared",
+}
 
 PHASE_DISCOVERY = "discovery"
 PHASE_QUALIFICATION = "qualification"
@@ -1084,6 +1096,16 @@ def _build_bundled_followup(convo: Dict[str, Any], max_items: int = 3) -> tuple[
     lines = [f"{idx}. {BUNDLE_FIELD_LABELS[field]}" for idx, field in enumerate(bundle, start=1)]
     prompt = "To keep things moving, could you share:\n" + "\n".join(lines)
     return prompt, bundle
+
+
+def _build_edit_summary(convo: Dict[str, Any]) -> str:
+    answers = convo.get("answers", {})
+    lines = []
+    for field in SUMMARY_FIELDS:
+        label = SUMMARY_FIELD_LABELS.get(field, field.title())
+        value = answers.get(field) or "—"
+        lines.append(f"• {label}: {value}")
+    return "Here’s what I have so far:\n" + "\n".join(lines)
 
 
 def _update_convo_phase(convo: Dict[str, Any]) -> str:
@@ -1850,6 +1872,17 @@ async def _intent_confusion(wa_id: str, convo: Dict[str, Any]) -> bool:
     return await _send_gentle_reassurance(wa_id, convo)
 
 
+async def _intent_edit_request(wa_id: str, convo: Dict[str, Any]) -> bool:
+    summary = _build_edit_summary(convo)
+    instructions = (
+        "Just let me know what to change—for example, ‘Change budget to 25L’ or ‘Update timeline to July’."
+    )
+    message = f"{summary}\n\n{instructions}"
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
+    _append_history(convo, "bot", message)
+    return True
+
+
 async def _send_gentle_reassurance(wa_id: str, convo: Dict[str, Any]) -> bool:
     name = _convo_display_name(convo)
     explainer = (
@@ -1872,6 +1905,7 @@ INTENT_ROUTER = {
     "smalltalk": _intent_smalltalk,
     "objection": _intent_objection,
     "confusion": _intent_confusion,
+    "edit_request": _intent_edit_request,
 }
 
 
