@@ -70,6 +70,7 @@ GRAPH_API_BASE = "https://graph.facebook.com/v20.0"
 STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
+MEET_LINK_TEMPLATE = os.getenv("MEET_LINK_TEMPLATE", MEETING_LINK)
 IST = ZoneInfo("Asia/Kolkata")
 def _parse_date_list(raw: str) -> Set[date]:
     results: Set[date] = set()
@@ -82,6 +83,17 @@ def _parse_date_list(raw: str) -> Set[date]:
         except ValueError:
             print(f"IGNORING INVALID HOLIDAY DATE: {value}")
     return results
+
+
+def _build_meet_link(meeting_id: str) -> str:
+    token = meeting_id.split("-")[0]
+    template = (MEET_LINK_TEMPLATE or "").strip()
+    if "{token}" in template:
+        return template.replace("{token}", token)
+    if template:
+        separator = "&" if "?" in template else "?"
+        return f"{template}{separator}id={token}"
+    return f"https://meet.google.com/lookup/varush-{token}"
 
 
 TEST_WA_IDS = {
@@ -489,8 +501,8 @@ MEETING_REMINDER_WINDOWS = [
     (600, "ten_minutes"),
 ]
 MEETING_REMINDER_MESSAGES = {
-    "two_hours": "Hi {name}! We’re just 2 hours away from reimagining your space together. Get ready for a design huddle that’ll spark new ideas and show how intricate (and fun) the process can be.",
-    "one_hour": "One hour to go! This session is where we unpack the latest finishes, trend insights, and the smart moves that set premium homes apart. Expect your mindset to shift in the best way.",
+    "two_hours": "Hi {name}! We’re just 2 hours away from reimagining your space together. Join via {link} and get ready for a design huddle that’ll spark new ideas and show how intricate (and fun) the process can be.",
+    "one_hour": "One hour to go! This session is where we unpack the latest finishes, trend insights, and the smart moves that set premium homes apart. Join via {link} and expect your mindset to shift in the best way.",
     "ten_minutes": "Final countdown—10 minutes! Keep your excitement up because we’re about to dive into the details that turn good spaces into unforgettable ones. Join via {link} and let’s create something special.",
 }
 
@@ -903,11 +915,13 @@ async def _admin_book_command(admin_wa: str, parts: List[str], state: Dict[str, 
     if not success:
         await _send_whatsapp_text(admin_wa, record_or_error, preview_url=False)
         return True
+    meeting_record = record_or_error
     convo = _apply_admin_fields(state, client_wa, extra_fields)
     state[client_wa] = convo
     label = slot_dt.strftime("%a, %d %b · %I:%M %p IST")
-    await _send_whatsapp_text(admin_wa, f"Booked {label} for +{client_wa}. I’ll notify the client.", preview_url=False)
-    await _notify_client_booking(client_wa, convo, label)
+    link = meeting_record.get("meet_link") or MEETING_LINK
+    await _send_whatsapp_text(admin_wa, f"Booked {label} for +{client_wa}. Meet link: {link}", preview_url=False)
+    await _notify_client_booking(client_wa, convo, label, meeting_record)
     return True
 
 
@@ -925,13 +939,16 @@ async def _admin_reschedule_command(admin_wa: str, parts: List[str], state: Dict
         return True
     _, note = _parse_admin_fields(parts[4:])
     success, message, record = _reschedule_existing_meeting(client_wa, slot_dt, admin_wa, note)
-    await _send_whatsapp_text(admin_wa, message, preview_url=False)
     if success and record:
+        link = record.get("meet_link") or MEETING_LINK
+        await _send_whatsapp_text(admin_wa, f"{message} Link: {link}", preview_url=False)
         convo = state.get(client_wa, {"answers": {}})
         convo = _ensure_convo_defaults(convo)
         state[client_wa] = convo
         label = slot_dt.strftime("%a, %d %b · %I:%M %p IST")
-        await _notify_client_reschedule(client_wa, convo, label)
+        await _notify_client_reschedule(client_wa, convo, label, record)
+    else:
+        await _send_whatsapp_text(admin_wa, message, preview_url=False)
     return True
 
 
@@ -1031,8 +1048,9 @@ def _create_meeting_record(client_wa: str, slot_dt: datetime, note: str | None, 
     meetings = _load_meetings()
     if _slot_conflicts(slot_utc, meetings):
         return False, "That slot just got booked. Pick another."
+    meeting_id = str(uuid4())
     record = {
-        "id": str(uuid4()),
+        "id": meeting_id,
         "wa_id": client_wa,
         "scheduled_at": slot_utc.isoformat(),
         "note": note,
@@ -1040,6 +1058,7 @@ def _create_meeting_record(client_wa: str, slot_dt: datetime, note: str | None, 
         "reminders_sent": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "created_by": admin_wa or "auto",
+        "meet_link": _build_meet_link(meeting_id),
     }
     meetings.append(record)
     _save_meetings(meetings)
@@ -1089,18 +1108,20 @@ def _cancel_existing_meeting(client_wa: str, reason: str, admin_wa: str) -> tupl
     return True, "Meeting cancelled."
 
 
-async def _notify_client_booking(client_wa: str, convo: Dict[str, Any], slot_label: str) -> None:
+async def _notify_client_booking(client_wa: str, convo: Dict[str, Any], slot_label: str, meeting: Dict[str, Any]) -> None:
     name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+    link = meeting.get("meet_link") or MEETING_LINK
     message = (
         f"Hi {name}! We’ve scheduled your Varush designer session for {slot_label}. "
-        "I’ll share the Meet link and reminders as we get closer."
+        f"Join via {link}. I’ll remind you as we get closer."
     )
     await _send_whatsapp_text(client_wa, message, preview_url=False)
 
 
-async def _notify_client_reschedule(client_wa: str, convo: Dict[str, Any], slot_label: str) -> None:
+async def _notify_client_reschedule(client_wa: str, convo: Dict[str, Any], slot_label: str, meeting: Dict[str, Any]) -> None:
     name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
-    message = f"Hi {name}! Your design session is now planned for {slot_label}. Let me know if you’d like to tweak anything."
+    link = meeting.get("meet_link") or MEETING_LINK
+    message = f"Hi {name}! Your design session is now planned for {slot_label}. Join via {link}."
     await _send_whatsapp_text(client_wa, message, preview_url=False)
 
 
@@ -1133,9 +1154,10 @@ async def _maybe_send_meeting_context(wa_id: str, convo: Dict[str, Any], now_ts:
     if now_ts - last_shared < 300:
         return
     label = _format_slot_label_from_iso(meeting.get("scheduled_at"))
+    link = meeting.get("meet_link") or MEETING_LINK
     message = (
         f"Quick reminder: we already have your design session booked for {label}. "
-        "Want to add/review anything before the call, adjust timing, or cancel?"
+        f"Join via {link}. Want to add/review anything, adjust timing, or cancel?"
     )
     await _send_whatsapp_text(wa_id, message, preview_url=False)
     context["last_shared_ts"] = now_ts
@@ -1217,10 +1239,13 @@ async def _handle_meeting_flow(wa_id: str, convo: Dict[str, Any], incoming_text:
             await _send_whatsapp_text(wa_id, "Please reply with the slot number so I can lock it.", preview_url=False)
             return True
         slot_dt = datetime.fromisoformat(selection["start"]).astimezone(IST)
-        success, message, _ = _reschedule_existing_meeting(wa_id, slot_dt, wa_id, None)
-        await _send_whatsapp_text(wa_id, message, preview_url=False)
-        if success:
+        success, message, record = _reschedule_existing_meeting(wa_id, slot_dt, wa_id, None)
+        if success and record:
+            link = record.get("meet_link") or MEETING_LINK
+            await _send_whatsapp_text(wa_id, f"{message} Join via {link}.", preview_url=False)
             convo.pop("meeting_flow", None)
+        else:
+            await _send_whatsapp_text(wa_id, message, preview_url=False)
         return True
     return False
 
@@ -2132,7 +2157,8 @@ def _build_meeting_message(label: str, meeting: Dict[str, Any], state: Dict[str,
     wa_id = meeting.get("wa_id", "")
     convo = state.get(wa_id, {})
     name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
-    return template.format(name=name, link=MEETING_LINK)
+    link = meeting.get("meet_link") or MEETING_LINK
+    return template.format(name=name, link=link)
 
 
 def _append_log(payload: Dict[str, Any]) -> None:
