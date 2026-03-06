@@ -456,6 +456,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     convo = state.get(wa_id, {
         "answers": {},
         "awaiting_field": None,
+        "awaiting_origin": None,
         "completed": False,
         "has_welcomed": False,
         "history": [],
@@ -474,6 +475,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     convo.setdefault("awaiting_recap_choice", False)
     convo.setdefault("last_recap_ts", 0.0)
     convo.setdefault("phase", PHASE_DISCOVERY)
+    convo.setdefault("awaiting_origin", None)
 
     previous_last_ts = convo.get("last_client_ts")
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -497,11 +499,18 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         return
 
     awaiting_field = convo.get("awaiting_field")
-    if awaiting_field:
+    awaiting_origin = convo.get("awaiting_origin")
+    should_force_capture = (
+        bool(awaiting_field)
+        and bool(incoming_text)
+        and (awaiting_origin == "legacy" or (awaiting_origin is None and not conversation_agent.is_ready))
+    )
+    if should_force_capture:
         convo["answers"][awaiting_field] = incoming_text
         if awaiting_field == "name" and not convo.get("contact_name"):
             convo["contact_name"] = incoming_text
         convo["awaiting_field"] = None
+        convo["awaiting_origin"] = None
 
     _hydrate_state_from_lead(wa_id, convo)
 
@@ -573,9 +582,11 @@ async def _run_legacy_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, A
         convo["completed"] = True
         convo["status"] = "completed"
         convo["awaiting_field"] = None
+        convo["awaiting_origin"] = None
     else:
         prompt = _build_question_prompt(next_field, convo)
         convo["awaiting_field"] = next_field
+        convo["awaiting_origin"] = "legacy"
         if not convo.get("has_welcomed"):
             welcome = _build_welcome_message(convo)
             message = f"{welcome}\n\n{prompt}" if welcome else prompt
@@ -632,6 +643,7 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
         convo["status"] = "handoff"
         convo["inactivity_paused"] = True
         convo["awaiting_field"] = None
+        convo["awaiting_origin"] = None
         convo["handoff_reason"] = handoff_reason or intent
         state[wa_id] = convo
         _save_state(state)
@@ -661,6 +673,7 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
         _append_history(convo, "bot", message)
         convo["has_welcomed"] = True
     convo["awaiting_field"] = follow_field
+    convo["awaiting_origin"] = "agent" if follow_field else None
 
     should_offer_meeting = (result.request_meeting and not requires_clarification) or (not _missing_fields(convo) and not requires_clarification)
     if should_offer_meeting and not convo.get("completed"):
@@ -711,10 +724,12 @@ async def _process_recap_choice(wa_id: str, convo: Dict[str, Any], incoming_text
         convo["status"] = "active"
         convo["has_welcomed"] = False
         convo["awaiting_field"] = None
+        convo["awaiting_origin"] = None
         next_field = _next_missing_field(convo) or "name"
         prompt = _build_question_prompt(next_field, convo)
         message = f"Fresh canvas — let’s capture this new project!\n\n{prompt}"
         convo["awaiting_field"] = next_field
+        convo["awaiting_origin"] = "legacy"
         await _send_whatsapp_text(wa_id, message, preview_url=False)
         _append_history(convo, "bot", message)
         return True
@@ -732,6 +747,7 @@ async def _process_recap_choice(wa_id: str, convo: Dict[str, Any], incoming_text
         prompt = _build_question_prompt(next_field, convo)
         message = f"Great, let’s continue from where we paused.\n\n{prompt}"
         convo["awaiting_field"] = next_field
+        convo["awaiting_origin"] = "legacy"
         await _send_whatsapp_text(wa_id, message, preview_url=False)
         _append_history(convo, "bot", message)
         return True
@@ -1599,6 +1615,7 @@ async def _send_gentle_reassurance(wa_id: str, convo: Dict[str, Any]) -> bool:
     if gentle_prompt:
         explainer = f"{explainer}\n\n{gentle_prompt}"
         convo["awaiting_field"] = follow_field
+        convo["awaiting_origin"] = "agent" if follow_field else None
     await _send_whatsapp_text(wa_id, explainer, preview_url=False)
     _append_history(convo, "bot", explainer)
     return True
