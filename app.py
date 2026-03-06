@@ -111,6 +111,12 @@ MEETING_POST_BUFFER_MINUTES = 30
 MEETING_LOOKAHEAD_DAYS = 21
 MEETING_DAY_START = time(11, 0)
 MEETING_DAY_END = time(17, 30)
+CANCEL_REASON_CHOICES = {
+    "1": {"code": "busy", "label": "Busy / tied up with work"},
+    "2": {"code": "booked_other", "label": "Booked another designer"},
+    "3": {"code": "not_interested", "label": "Not interested anymore"},
+    "4": {"code": "reschedule", "label": "Need to reschedule"},
+}
 
 scoring_agent = LeadScoringAgent()
 conversation_agent = ConversationAgent()
@@ -792,6 +798,25 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
             _save_state(state)
             return
 
+    if await _handle_meeting_flow(wa_id, convo, incoming_text):
+        state[wa_id] = convo
+        _save_state(state)
+        return
+
+    active_meeting = _get_active_meeting_record(wa_id)
+    if active_meeting and _detect_cancel_request(incoming_text):
+        await _start_client_cancellation(wa_id, convo)
+        state[wa_id] = convo
+        _save_state(state)
+        return
+    if active_meeting and _detect_reschedule_request(incoming_text):
+        await _start_client_reschedule(wa_id, convo)
+        state[wa_id] = convo
+        _save_state(state)
+        return
+
+    await _maybe_send_meeting_context(wa_id, convo, now_ts)
+
     if convo.get("awaiting_recap_choice"):
         handled = await _process_recap_choice(wa_id, convo, incoming_text)
         if handled:
@@ -1085,6 +1110,138 @@ async def _notify_client_cancellation(client_wa: str, convo: Dict[str, Any] | No
         f"Hi {name}. I’ve noted your cancellation ({reason_label}). When you’re ready, just message me and we’ll set up a new slot."
     )
     await _send_whatsapp_text(client_wa, message, preview_url=False)
+
+
+def _get_active_meeting_record(wa_id: str) -> Dict[str, Any] | None:
+    meetings = _load_meetings()
+    return _find_active_meeting(meetings, wa_id)
+
+
+def _format_slot_label_from_iso(iso_value: str | None) -> str:
+    slot_dt = _parse_meeting_time(iso_value)
+    if not slot_dt:
+        return "the scheduled time"
+    return slot_dt.astimezone(IST).strftime("%a, %d %b · %I:%M %p IST")
+
+
+async def _maybe_send_meeting_context(wa_id: str, convo: Dict[str, Any], now_ts: float) -> None:
+    meeting = _get_active_meeting_record(wa_id)
+    if not meeting:
+        return
+    context = convo.setdefault("meeting_context", {})
+    last_shared = context.get("last_shared_ts", 0)
+    if now_ts - last_shared < 300:
+        return
+    label = _format_slot_label_from_iso(meeting.get("scheduled_at"))
+    message = (
+        f"Quick reminder: we already have your design session booked for {label}. "
+        "Want to add/review anything before the call, adjust timing, or cancel?"
+    )
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
+    context["last_shared_ts"] = now_ts
+
+
+def _detect_cancel_request(text: str) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in ["cancel", "called off", "drop the meeting"])
+
+
+def _detect_reschedule_request(text: str) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in ["resched", "change time", "another time", "move the meeting", "postpone"])
+
+
+async def _start_client_cancellation(wa_id: str, convo: Dict[str, Any]) -> None:
+    convo["meeting_flow"] = {"mode": "cancel", "awaiting": "reason"}
+    lines = [f"{num}. {info['label']}" for num, info in CANCEL_REASON_CHOICES.items()]
+    message = (
+        "Totally okay! What’s the main reason?\n" + "\n".join(lines) + "\n\nReply with the number that fits best."
+    )
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
+
+
+async def _start_client_reschedule(wa_id: str, convo: Dict[str, Any]) -> None:
+    slots = _generate_meeting_slots()
+    if not slots:
+        await _send_whatsapp_text(
+            wa_id,
+            "We’re fully booked over the next few days. Share a day/time that suits you and I’ll try to arrange it.",
+            preview_url=False,
+        )
+        convo.pop("meeting_flow", None)
+        return
+    slot_lines = [f"{idx+1}. {slot['label']}" for idx, slot in enumerate(slots)]
+    message = (
+        "No problem—we can move it. Pick one of these slots (reply with the number):\n"
+        + "\n".join(slot_lines)
+    )
+    convo["meeting_flow"] = {"mode": "reschedule", "awaiting": "slot", "slots": slots}
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
+
+
+async def _handle_meeting_flow(wa_id: str, convo: Dict[str, Any], incoming_text: str) -> bool:
+    flow = convo.get("meeting_flow")
+    if not flow:
+        return False
+    mode = flow.get("mode")
+    if mode == "cancel":
+        awaiting = flow.get("awaiting")
+        if awaiting == "reason":
+            choice = _parse_cancel_choice(incoming_text)
+            if not choice:
+                await _send_whatsapp_text(wa_id, "Just reply with 1, 2, 3, or 4 so I know which bucket fits best.", preview_url=False)
+                return True
+            if choice in {"busy", "reschedule"}:
+                await _start_client_reschedule(wa_id, convo)
+                return True
+            if choice in {"booked_other", "not_interested"}:
+                flow["awaiting"] = "feedback"
+                flow["reason_code"] = choice
+                await _send_whatsapp_text(
+                    wa_id,
+                    "Got it—could you share what we could improve or what made you switch?",
+                    preview_url=False,
+                )
+                return True
+        if awaiting == "feedback":
+            reason_code = flow.get("reason_code", "client_cancelled")
+            feedback = incoming_text.strip()
+            reason_text = f"{reason_code}:{feedback}" if feedback else reason_code
+            success, message = _cancel_existing_meeting(wa_id, reason_text, wa_id)
+            convo.pop("meeting_flow", None)
+            await _send_whatsapp_text(wa_id, message, preview_url=False)
+            return True
+    if mode == "reschedule" and flow.get("awaiting") == "slot":
+        selection = _select_slot_from_message(incoming_text, flow.get("slots") or [])
+        if not selection:
+            await _send_whatsapp_text(wa_id, "Please reply with the slot number so I can lock it.", preview_url=False)
+            return True
+        slot_dt = datetime.fromisoformat(selection["start"]).astimezone(IST)
+        success, message, _ = _reschedule_existing_meeting(wa_id, slot_dt, wa_id, None)
+        await _send_whatsapp_text(wa_id, message, preview_url=False)
+        if success:
+            convo.pop("meeting_flow", None)
+        return True
+    return False
+
+
+def _parse_cancel_choice(text: str) -> str | None:
+    lowered = text.strip().lower()
+    if lowered in CANCEL_REASON_CHOICES:
+        return CANCEL_REASON_CHOICES[lowered]["code"]
+    for info in CANCEL_REASON_CHOICES.values():
+        if info["code"] in lowered or info["label"].lower() in lowered:
+            return info["code"]
+    return None
+
+
+def _select_slot_from_message(text: str, slots: List[Dict[str, str]]) -> Dict[str, str] | None:
+    stripped = text.strip()
+    if stripped.isdigit():
+        idx = int(stripped) - 1
+        if 0 <= idx < len(slots):
+            return slots[idx]
+    return None
 
 
 async def _run_legacy_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, Any]) -> None:
