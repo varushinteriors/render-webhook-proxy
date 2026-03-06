@@ -63,7 +63,29 @@ def _reset_file(path: Path, payload: Any) -> None:
     tmp.replace(path)
 
 
-def _reset_conversations(path: Path, keep_wa_ids: Tuple[str, ...]) -> None:
+def _reset_conversations(
+    path: Path,
+    keep_wa_ids: Tuple[str, ...],
+    only_tests: bool,
+    tester_ids: Tuple[str, ...],
+) -> None:
+    tester_tuple = tuple(wa for wa in tester_ids if wa)
+    if only_tests and tester_tuple:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (json.JSONDecodeError, FileNotFoundError):
+            data = {}
+        removed = 0
+        if isinstance(data, dict):
+            for wa in tester_tuple:
+                if wa in data:
+                    removed += 1
+                    data.pop(wa, None)
+        _reset_file(path, data if isinstance(data, dict) else {})
+        print(f"Cleared tester conversations → {path} (removed {removed})")
+        return
+
     keep = tuple(wa for wa in keep_wa_ids if wa)
     if not keep:
         _reset_file(path, {})
@@ -93,19 +115,21 @@ def main() -> None:
     )
     parser.add_argument("--keep-wa", dest="keep_wa", action="append", help="WA IDs to preserve in conversation state.")
     parser.add_argument("--include-tests", action="store_true", help="Also wipe default tester WA IDs.")
+    parser.add_argument("--only-tests", action="store_true", help="Wipe only the default tester WA IDs from conversation state.")
     parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt.")
     args = parser.parse_args()
 
     targets = args.targets or list(DEFAULT_TARGETS.keys())
-    keep_wa = []
-    if not args.include_tests:
-        keep_wa.extend(DEFAULT_TEST_WA_IDS)
-    if args.keep_wa:
-        keep_wa.extend(args.keep_wa)
-    keep_wa_tuple = tuple({wa.strip(): None for wa in keep_wa if wa}.keys())
-
-    if keep_wa_tuple:
-        print("Preserving WA IDs:", ", ".join(keep_wa_tuple))
+    keep_wa_tuple: Tuple[str, ...] = tuple()
+    if not args.only_tests:
+        keep_wa = []
+        if not args.include_tests:
+            keep_wa.extend(DEFAULT_TEST_WA_IDS)
+        if args.keep_wa:
+            keep_wa.extend(args.keep_wa)
+        keep_wa_tuple = tuple({wa.strip(): None for wa in keep_wa if wa}.keys())
+        if keep_wa_tuple:
+            print("Preserving WA IDs:", ", ".join(keep_wa_tuple))
 
     print("State reset targets:")
     for key in targets:
@@ -121,7 +145,12 @@ def main() -> None:
     for key in targets:
         path = _resolve_path(key)
         if key == "conversations":
-            _reset_conversations(path, keep_wa_tuple)
+            _reset_conversations(
+                path,
+                keep_wa_tuple,
+                args.only_tests,
+                tuple(DEFAULT_TEST_WA_IDS),
+            )
             continue
         payload = DEFAULT_TARGETS[key]["empty"]
         _reset_file(path, payload)
