@@ -5,7 +5,8 @@ import os
 from collections import deque
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -70,6 +71,19 @@ STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
 IST = ZoneInfo("Asia/Kolkata")
+def _parse_date_list(raw: str) -> Set[date]:
+    results: Set[date] = set()
+    for value in raw.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            results.add(date.fromisoformat(value))
+        except ValueError:
+            print(f"IGNORING INVALID HOLIDAY DATE: {value}")
+    return results
+
+
 TEST_WA_IDS = {
     wa.strip()
     for wa in os.getenv(
@@ -83,11 +97,7 @@ ADMIN_WA_IDS = {
     for wa in os.getenv("ADMIN_WA_IDS", "").split(",")
     if wa.strip()
 }
-HOLIDAY_DATES = {
-    date.fromisoformat(value.strip())
-    for value in os.getenv("HOLIDAY_DATES", "").split(",")
-    if value.strip()
-}
+HOLIDAY_DATES = _parse_date_list(os.getenv("HOLIDAY_DATES", ""))
 FIXED_HOLIDAY_MM_DD = {
     "01-01",  # New Year
     "01-26",  # Republic Day
@@ -206,6 +216,10 @@ def _r2_upload_path(path: Path, key: str | None) -> None:
 
 def _is_test_wa(wa_id: str | None) -> bool:
     return bool(wa_id and wa_id in TEST_WA_IDS)
+
+
+def _is_admin_wa(wa_id: str | None) -> bool:
+    return bool(wa_id and wa_id in ADMIN_WA_IDS)
 
 
 QUESTION_FLOW = [
@@ -651,6 +665,19 @@ def _match_contact_name(contacts: List[Dict[str, Any]], wa_id: str) -> str | Non
     return None
 
 
+def _ensure_convo_defaults(convo: Dict[str, Any]) -> Dict[str, Any]:
+    convo.setdefault("answers", {})
+    convo.setdefault("history", [])
+    convo.setdefault("escalations", {})
+    convo.setdefault("status", "active")
+    convo.setdefault("has_recap_prompted", False)
+    convo.setdefault("awaiting_recap_choice", False)
+    convo.setdefault("last_recap_ts", 0.0)
+    convo.setdefault("phase", PHASE_DISCOVERY)
+    convo.setdefault("awaiting_origin", None)
+    return convo
+
+
 async def _handle_media_message(
     wa_id: str,
     msg_type: str,
@@ -705,15 +732,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         "last_recap_ts": 0.0,
         "phase": PHASE_DISCOVERY,
     })
-    convo.setdefault("answers", {})
-    convo.setdefault("history", [])
-    convo.setdefault("escalations", {})
-    convo.setdefault("status", "active")
-    convo.setdefault("has_recap_prompted", False)
-    convo.setdefault("awaiting_recap_choice", False)
-    convo.setdefault("last_recap_ts", 0.0)
-    convo.setdefault("phase", PHASE_DISCOVERY)
-    convo.setdefault("awaiting_origin", None)
+    convo = _ensure_convo_defaults(convo)
     if _is_test_wa(wa_id):
         convo["is_test"] = True
 
@@ -766,6 +785,13 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     if incoming_text:
         _append_history(convo, "client", incoming_text)
 
+    if _is_admin_wa(wa_id):
+        handled_admin = await _process_admin_command(wa_id, incoming_text, state)
+        if handled_admin:
+            state[wa_id] = convo
+            _save_state(state)
+            return
+
     if convo.get("awaiting_recap_choice"):
         handled = await _process_recap_choice(wa_id, convo, incoming_text)
         if handled:
@@ -817,6 +843,248 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
             return
 
     await _run_agent_flow(wa_id, convo, state, agent_result)
+
+
+async def _process_admin_command(wa_id: str, incoming_text: str, state: Dict[str, Any]) -> bool:
+    if not incoming_text:
+        return False
+    parts = incoming_text.strip().split()
+    if not parts:
+        return False
+    command = parts[0].lower()
+    if command == "book":
+        return await _admin_book_command(wa_id, parts, state)
+    if command == "reschedule":
+        return await _admin_reschedule_command(wa_id, parts, state)
+    if command == "cancel":
+        return await _admin_cancel_command(wa_id, parts, state)
+    return False
+
+
+async def _admin_book_command(admin_wa: str, parts: List[str], state: Dict[str, Any]) -> bool:
+    if len(parts) < 4:
+        await _send_whatsapp_text(admin_wa, "Usage: book <phone> <YYYY-MM-DD> <HH:MM> [key=value ...]", preview_url=False)
+        return True
+    client_wa = _normalize_phone(parts[1])
+    if not client_wa:
+        await _send_whatsapp_text(admin_wa, "Invalid phone number.", preview_url=False)
+        return True
+    slot_dt = _parse_admin_slot(parts[2], parts[3])
+    if not slot_dt:
+        await _send_whatsapp_text(admin_wa, "Pick a slot within working hours (11:30 AM–4:50 PM IST, weekdays only).", preview_url=False)
+        return True
+    extra_fields, note = _parse_admin_fields(parts[4:])
+    success, record_or_error = _create_meeting_record(client_wa, slot_dt, note, admin_wa)
+    if not success:
+        await _send_whatsapp_text(admin_wa, record_or_error, preview_url=False)
+        return True
+    convo = _apply_admin_fields(state, client_wa, extra_fields)
+    state[client_wa] = convo
+    label = slot_dt.strftime("%a, %d %b · %I:%M %p IST")
+    await _send_whatsapp_text(admin_wa, f"Booked {label} for +{client_wa}. I’ll notify the client.", preview_url=False)
+    await _notify_client_booking(client_wa, convo, label)
+    return True
+
+
+async def _admin_reschedule_command(admin_wa: str, parts: List[str], state: Dict[str, Any]) -> bool:
+    if len(parts) < 4:
+        await _send_whatsapp_text(admin_wa, "Usage: reschedule <phone> <YYYY-MM-DD> <HH:MM> [note=...]", preview_url=False)
+        return True
+    client_wa = _normalize_phone(parts[1])
+    if not client_wa:
+        await _send_whatsapp_text(admin_wa, "Invalid phone number.", preview_url=False)
+        return True
+    slot_dt = _parse_admin_slot(parts[2], parts[3])
+    if not slot_dt:
+        await _send_whatsapp_text(admin_wa, "Pick a slot within working hours (11:30 AM–4:50 PM IST, weekdays only).", preview_url=False)
+        return True
+    _, note = _parse_admin_fields(parts[4:])
+    success, message, record = _reschedule_existing_meeting(client_wa, slot_dt, admin_wa, note)
+    await _send_whatsapp_text(admin_wa, message, preview_url=False)
+    if success and record:
+        convo = state.get(client_wa, {"answers": {}})
+        convo = _ensure_convo_defaults(convo)
+        state[client_wa] = convo
+        label = slot_dt.strftime("%a, %d %b · %I:%M %p IST")
+        await _notify_client_reschedule(client_wa, convo, label)
+    return True
+
+
+async def _admin_cancel_command(admin_wa: str, parts: List[str], state: Dict[str, Any]) -> bool:
+    if len(parts) < 2:
+        await _send_whatsapp_text(admin_wa, "Usage: cancel <phone> [reason=...]", preview_url=False)
+        return True
+    client_wa = _normalize_phone(parts[1])
+    if not client_wa:
+        await _send_whatsapp_text(admin_wa, "Invalid phone number.", preview_url=False)
+        return True
+    fields, reason = _parse_admin_fields(parts[2:])
+    if not reason:
+        reason = "admin_cancelled"
+    success, message = _cancel_existing_meeting(client_wa, reason, admin_wa)
+    await _send_whatsapp_text(admin_wa, message, preview_url=False)
+    if success:
+        convo = state.get(client_wa)
+        label = reason.replace("_", " ")
+        await _notify_client_cancellation(client_wa, convo, label)
+    return True
+
+
+def _parse_admin_slot(date_str: str, time_str: str) -> datetime | None:
+    try:
+        day = date.fromisoformat(date_str)
+        hour, minute = map(int, time_str.split(":"))
+    except ValueError:
+        return None
+    candidate = datetime.combine(day, time(hour, minute), tzinfo=IST)
+    valid_slots = _generate_day_slots(day)
+    for slot in valid_slots:
+        if slot.hour == candidate.hour and slot.minute == candidate.minute:
+            return slot
+    return None
+
+
+def _parse_admin_fields(tokens: List[str]) -> tuple[Dict[str, str], str | None]:
+    fields: Dict[str, str] = {}
+    free_text: List[str] = []
+    for token in tokens:
+        if "=" in token:
+            key, value = token.split("=", 1)
+            fields[key.lower()] = value.replace("_", " ")
+        else:
+            free_text.append(token)
+    note = " ".join(free_text).strip() if free_text else None
+    if "note" in fields:
+        note = f"{note + ' ' if note else ''}{fields.pop('note')}".strip()
+    return fields, note or None
+
+
+ADMIN_FIELD_MAP = {
+    "name": "name",
+    "service": "service_type",
+    "service_type": "service_type",
+    "location": "location",
+    "project": "project_type",
+    "property": "project_type",
+    "area": "area",
+    "budget": "budget",
+    "timeline": "timeline",
+    "finish": "finish",
+}
+
+
+def _apply_admin_fields(state: Dict[str, Any], client_wa: str, fields: Dict[str, str]) -> Dict[str, Any]:
+    convo = state.get(client_wa, {
+        "answers": {},
+        "awaiting_field": None,
+        "awaiting_origin": None,
+        "completed": False,
+        "has_welcomed": False,
+        "history": [],
+        "status": "active",
+        "escalations": {},
+        "has_recap_prompted": False,
+        "awaiting_recap_choice": False,
+        "last_recap_ts": 0.0,
+        "phase": PHASE_DISCOVERY,
+    })
+    convo = _ensure_convo_defaults(convo)
+    answers = convo.setdefault("answers", {})
+    for key, value in fields.items():
+        state_field = ADMIN_FIELD_MAP.get(key)
+        if not state_field:
+            continue
+        answers[state_field] = value
+        if state_field == "name":
+            convo["contact_name"] = value
+    state[client_wa] = convo
+    return convo
+
+
+def _create_meeting_record(client_wa: str, slot_dt: datetime, note: str | None, admin_wa: str | None) -> tuple[bool, str | Dict[str, Any]]:
+    slot_utc = slot_dt.astimezone(timezone.utc)
+    meetings = _load_meetings()
+    if _slot_conflicts(slot_utc, meetings):
+        return False, "That slot just got booked. Pick another."
+    record = {
+        "id": str(uuid4()),
+        "wa_id": client_wa,
+        "scheduled_at": slot_utc.isoformat(),
+        "note": note,
+        "status": "scheduled",
+        "reminders_sent": [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_by": admin_wa or "auto",
+    }
+    meetings.append(record)
+    _save_meetings(meetings)
+    return True, record
+
+
+def _find_active_meeting(meetings: List[Dict[str, Any]], client_wa: str) -> Dict[str, Any] | None:
+    for meeting in meetings:
+        if meeting.get("wa_id") == client_wa and meeting.get("status") == "scheduled":
+            return meeting
+    return None
+
+
+def _reschedule_existing_meeting(client_wa: str, slot_dt: datetime, admin_wa: str, note: str | None) -> tuple[bool, str, Dict[str, Any] | None]:
+    meetings = _load_meetings()
+    target = _find_active_meeting(meetings, client_wa)
+    if not target:
+        return False, "No upcoming meeting to reschedule for that number.", None
+    slot_utc = slot_dt.astimezone(timezone.utc)
+    if _slot_conflicts(slot_utc, meetings, ignore_record=target):
+        return False, "That slot conflicts with another booking.", None
+    history = target.setdefault("history", [])
+    history.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": "rescheduled",
+        "by": admin_wa,
+        "from": target.get("scheduled_at"),
+        "to": slot_utc.isoformat(),
+    })
+    target["scheduled_at"] = slot_utc.isoformat()
+    target["note"] = note or target.get("note")
+    _save_meetings(meetings)
+    label = slot_dt.strftime("%a, %d %b · %I:%M %p IST")
+    return True, f"Rescheduled to {label}.", target
+
+
+def _cancel_existing_meeting(client_wa: str, reason: str, admin_wa: str) -> tuple[bool, str]:
+    meetings = _load_meetings()
+    target = _find_active_meeting(meetings, client_wa)
+    if not target:
+        return False, "No upcoming meeting to cancel for that number."
+    target["status"] = "cancelled"
+    target["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+    target["cancelled_by"] = admin_wa
+    target["cancellation_reason"] = reason
+    _save_meetings(meetings)
+    return True, "Meeting cancelled."
+
+
+async def _notify_client_booking(client_wa: str, convo: Dict[str, Any], slot_label: str) -> None:
+    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+    message = (
+        f"Hi {name}! We’ve scheduled your Varush designer session for {slot_label}. "
+        "I’ll share the Meet link and reminders as we get closer."
+    )
+    await _send_whatsapp_text(client_wa, message, preview_url=False)
+
+
+async def _notify_client_reschedule(client_wa: str, convo: Dict[str, Any], slot_label: str) -> None:
+    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
+    message = f"Hi {name}! Your design session is now planned for {slot_label}. Let me know if you’d like to tweak anything."
+    await _send_whatsapp_text(client_wa, message, preview_url=False)
+
+
+async def _notify_client_cancellation(client_wa: str, convo: Dict[str, Any] | None, reason_label: str) -> None:
+    name = (convo or {}).get("contact_name") or (convo or {}).get("answers", {}).get("name") or "there"
+    message = (
+        f"Hi {name}. I’ve noted your cancellation ({reason_label}). When you’re ready, just message me and we’ll set up a new slot."
+    )
+    await _send_whatsapp_text(client_wa, message, preview_url=False)
 
 
 async def _run_legacy_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, Any]) -> None:
@@ -1391,10 +1659,16 @@ def _generate_day_slots(day: date) -> List[datetime]:
     return slots
 
 
-def _slot_conflicts(slot_dt_utc: datetime, meetings: List[Dict[str, Any]]) -> bool:
+def _slot_conflicts(
+    slot_dt_utc: datetime,
+    meetings: List[Dict[str, Any]],
+    ignore_record: Dict[str, Any] | None = None,
+) -> bool:
     block_start = slot_dt_utc - timedelta(minutes=MEETING_PREP_BUFFER_MINUTES)
     block_end = slot_dt_utc + timedelta(minutes=MEETING_SLOT_MINUTES + MEETING_POST_BUFFER_MINUTES)
     for meeting in meetings:
+        if meeting is ignore_record:
+            continue
         if meeting.get("status") != "scheduled":
             continue
         scheduled_at = _parse_meeting_time(meeting.get("scheduled_at"))
