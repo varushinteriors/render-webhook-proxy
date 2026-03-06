@@ -141,7 +141,7 @@ class ConversationAgent:
         print(f"LLM PHASE: {phase_text}")
         print(f"LLM MODEL USED: {self.model}")
         try:
-            response = await self.client.responses.parse(
+            response = await self.client.responses.create(
                 model=self.model,
                 input=[
                     {
@@ -153,7 +153,7 @@ class ConversationAgent:
                         "content": [{"type": "text", "text": user_prompt}],
                     },
                 ],
-                response_format=RESPONSE_SCHEMA,
+                response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
             )
             print("LLM RESPONSE RECEIVED")
         except Exception as exc:  # pylint: disable=broad-except
