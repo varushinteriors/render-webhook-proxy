@@ -153,7 +153,6 @@ class ConversationAgent:
                         "content": [{"type": "text", "text": user_prompt}],
                     },
                 ],
-                response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
             )
             print("LLM RESPONSE RECEIVED")
         except Exception as exc:  # pylint: disable=broad-except
