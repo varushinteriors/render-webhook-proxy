@@ -386,6 +386,25 @@ def _sanitize_answers(convo: Dict[str, Any]) -> None:
         answers.pop(field, None)
 
 
+BUNDLE_FIELD_ORDER = [
+    "service_type",
+    "location",
+    "project_type",
+    "area",
+    "budget",
+    "timeline",
+    "finish",
+]
+BUNDLE_FIELD_LABELS = {
+    "service_type": "Service type (interior design, architecture, turnkey, etc.)",
+    "location": "City / property location",
+    "project_type": "Property type (2/3/4 BHK, villa, office, etc.)",
+    "area": "Approximate size in sq. ft.",
+    "budget": "Budget bracket (<10L, 10–20L, 20–30L, >30L, or flexible)",
+    "timeline": "Planned start timeline (immediate, 3 months, 6 months, etc.)",
+    "finish": "Preferred finish (budget, premium, luxury)",
+}
+
 PHASE_DISCOVERY = "discovery"
 PHASE_QUALIFICATION = "qualification"
 PHASE_VALUE_BUILD = "value_build"
@@ -858,11 +877,24 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     if reply_text:
         reply_parts.append(reply_text)
 
+    bundle_prompt: str | None = None
+    bundle_fields: List[str] = []
+    if not skip_forced_follow and convo.get("phase") in {PHASE_DISCOVERY, PHASE_QUALIFICATION}:
+        bundle_prompt, bundle_fields = _build_bundled_followup(convo)
+
     follow_up_prompt = result.follow_up_prompt.strip() if result.follow_up_prompt else None
-    if follow_up_prompt and not skip_forced_follow:
+    allow_bundle = bool(bundle_prompt and (not next_field or next_field in bundle_fields))
+
+    if allow_bundle:
+        reply_parts.append(bundle_prompt)
+        if bundle_fields:
+            follow_field = bundle_fields[0]
+    elif follow_up_prompt and not skip_forced_follow:
         reply_parts.append(follow_up_prompt)
         if next_field:
             follow_field = next_field
+    elif not skip_forced_follow and next_field:
+        follow_field = next_field
 
     message = "\n\n".join(part for part in reply_parts if part)
 
@@ -1041,6 +1073,17 @@ def _build_gentle_project_prompt(convo: Dict[str, Any]) -> tuple[str | None, str
         if not answers.get(field):
             return _build_question_prompt(field, convo), field
     return None, None
+
+
+def _build_bundled_followup(convo: Dict[str, Any], max_items: int = 3) -> tuple[str | None, List[str]]:
+    answers = convo.get("answers", {})
+    missing = [field for field in BUNDLE_FIELD_ORDER if not answers.get(field)]
+    bundle = missing[:max_items]
+    if len(bundle) < 2:
+        return None, []
+    lines = [f"{idx}. {BUNDLE_FIELD_LABELS[field]}" for idx, field in enumerate(bundle, start=1)]
+    prompt = "To keep things moving, could you share:\n" + "\n".join(lines)
+    return prompt, bundle
 
 
 def _update_convo_phase(convo: Dict[str, Any]) -> str:
