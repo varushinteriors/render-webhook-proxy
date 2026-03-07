@@ -2,6 +2,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import time
 from collections import deque
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -73,11 +74,17 @@ STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
 MEET_LINK_TEMPLATE = os.getenv("MEET_LINK_TEMPLATE", MEETING_LINK)
+ZOOM_ACCOUNT_ID = os.getenv("ZOOM_ACCOUNT_ID", "").strip()
+ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID", "").strip()
+ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET", "").strip()
+ZOOM_USER_ID = os.getenv("ZOOM_USER_ID", "me").strip()
 IST = ZoneInfo("Asia/Kolkata")
 GOOGLE_CALENDAR_CREDENTIALS_JSON = os.getenv("GOOGLE_CALENDAR_CREDENTIALS_JSON") or os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "").strip()
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 _CALENDAR_SERVICE = None
+_ZOOM_ACCESS_TOKEN: str | None = None
+_ZOOM_TOKEN_EXPIRY = 0.0
 def _parse_date_list(raw: str) -> Set[date]:
     results: Set[date] = set()
     for value in raw.split(","):
@@ -100,6 +107,129 @@ def _build_meet_link(meeting_id: str) -> str:
         separator = "&" if "?" in template else "?"
         return f"{template}{separator}id={token}"
     return f"https://meet.google.com/lookup/varush-{token}"
+
+
+def _zoom_enabled() -> bool:
+    return bool(ZOOM_ACCOUNT_ID and ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET)
+
+
+def _get_zoom_access_token() -> str | None:
+    global _ZOOM_ACCESS_TOKEN, _ZOOM_TOKEN_EXPIRY
+    if not _zoom_enabled():
+        return None
+    now = time.time()
+    if _ZOOM_ACCESS_TOKEN and now < _ZOOM_TOKEN_EXPIRY:
+        return _ZOOM_ACCESS_TOKEN
+    try:
+        resp = httpx.post(
+            "https://zoom.us/oauth/token",
+            params={"grant_type": "account_credentials", "account_id": ZOOM_ACCOUNT_ID},
+            auth=(ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET),
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        print(f"ZOOM AUTH ERROR: {exc}")
+        _ZOOM_ACCESS_TOKEN = None
+        _ZOOM_TOKEN_EXPIRY = 0.0
+        return None
+    data = resp.json()
+    token = data.get("access_token")
+    if not token:
+        print("ZOOM AUTH ERROR: Missing access_token in response")
+        return None
+    expires_in = data.get("expires_in", 0) or 0
+    _ZOOM_ACCESS_TOKEN = token
+    _ZOOM_TOKEN_EXPIRY = now + max(0, expires_in - 30)
+    return _ZOOM_ACCESS_TOKEN
+
+
+def _zoom_request(method: str, path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+    token = _get_zoom_access_token()
+    if not token:
+        return None
+    url = f"https://api.zoom.us/v2/{path.lstrip('/')}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = httpx.request(method.upper(), url, headers=headers, json=payload, timeout=10.0)
+        if resp.status_code == 204 or not resp.content:
+            return {}
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        print(f"ZOOM API ERROR [{method.upper()} {path}]: {exc}")
+        return None
+
+
+def _format_zoom_start_time(slot_dt: datetime) -> str:
+    return (
+        slot_dt.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _create_zoom_meeting(record: Dict[str, Any], slot_dt: datetime, client_name: str | None) -> str | None:
+    if not _zoom_enabled():
+        return None
+    user_id = ZOOM_USER_ID or "me"
+    topic_name = client_name or record.get("wa_id") or "Client"
+    payload = {
+        "topic": f"Varush design chat – {topic_name}",
+        "type": 2,
+        "start_time": _format_zoom_start_time(slot_dt),
+        "duration": MEETING_SLOT_MINUTES,
+        "timezone": "UTC",
+        "agenda": f"Varush intro call with {topic_name}",
+        "settings": {
+            "waiting_room": True,
+            "join_before_host": True,
+            "approval_type": 0,
+        },
+    }
+    data = _zoom_request("POST", f"users/{user_id}/meetings", payload)
+    if not data:
+        return None
+    record["zoom_meeting_id"] = str(data.get("id")) if data.get("id") is not None else None
+    record["zoom_join_url"] = data.get("join_url")
+    record["zoom_start_url"] = data.get("start_url")
+    record["meeting_provider"] = "zoom"
+    return record.get("zoom_join_url")
+
+
+def _update_zoom_meeting(record: Dict[str, Any], slot_dt: datetime) -> None:
+    meeting_id = record.get("zoom_meeting_id")
+    if not (meeting_id and _zoom_enabled()):
+        return
+    payload = {
+        "start_time": _format_zoom_start_time(slot_dt),
+        "duration": MEETING_SLOT_MINUTES,
+        "timezone": "UTC",
+    }
+    _zoom_request("PATCH", f"meetings/{meeting_id}", payload)
+
+
+def _delete_zoom_meeting(record: Dict[str, Any]) -> None:
+    meeting_id = record.get("zoom_meeting_id")
+    if not (meeting_id and _zoom_enabled()):
+        return
+    _zoom_request("DELETE", f"meetings/{meeting_id}")
+
+
+def _render_calendar_description(record: Dict[str, Any]) -> str:
+    lines = [f"WhatsApp: +{record.get('wa_id')}"]
+    link = record.get("meet_link")
+    if link:
+        provider = (record.get("meeting_provider") or "meeting").capitalize()
+        lines.append(f"{provider} link: {link}")
+    host_link = record.get("zoom_start_url")
+    if host_link:
+        lines.append(f"Host start URL: {host_link}")
+    note = record.get("note")
+    if note:
+        lines.append(f"Note: {note}")
+    return "\n".join(lines)
 
 
 def _get_calendar_service():
@@ -128,7 +258,7 @@ def _create_calendar_event(record: Dict[str, Any], slot_dt: datetime, client_nam
     name = client_name or record.get("wa_id")
     body = {
         "summary": f"Varush design chat – {name}",
-        "description": f"WhatsApp: +{record.get('wa_id')}",
+        "description": _render_calendar_description(record),
         "start": {"dateTime": slot_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
         "end": {"dateTime": end_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
         "conferenceData": {
@@ -160,6 +290,7 @@ def _update_calendar_event(record: Dict[str, Any], slot_dt: datetime) -> None:
     body = {
         "start": {"dateTime": slot_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
         "end": {"dateTime": end_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
+        "description": _render_calendar_description(record),
     }
     try:
         event = (
@@ -1158,9 +1289,13 @@ def _create_meeting_record(
         "created_by": admin_wa or "auto",
         "meet_link": _build_meet_link(meeting_id),
     }
+    zoom_link = _create_zoom_meeting(record, slot_dt, client_name)
+    if zoom_link:
+        record["meet_link"] = zoom_link
     calendar_link = _create_calendar_event(record, slot_dt, client_name)
-    if calendar_link:
+    if calendar_link and not record.get("meeting_provider"):
         record["meet_link"] = calendar_link
+        record["meeting_provider"] = "google"
     meetings.append(record)
     _save_meetings(meetings)
     return True, record
@@ -1191,6 +1326,7 @@ def _reschedule_existing_meeting(client_wa: str, slot_dt: datetime, admin_wa: st
     })
     target["scheduled_at"] = slot_utc.isoformat()
     target["note"] = note or target.get("note")
+    _update_zoom_meeting(target, slot_dt)
     _update_calendar_event(target, slot_dt)
     _save_meetings(meetings)
     label = slot_dt.strftime("%a, %d %b · %I:%M %p IST")
@@ -1206,6 +1342,7 @@ def _cancel_existing_meeting(client_wa: str, reason: str, admin_wa: str) -> tupl
     target["cancelled_at"] = datetime.now(timezone.utc).isoformat()
     target["cancelled_by"] = admin_wa
     target["cancellation_reason"] = reason
+    _delete_zoom_meeting(target)
     _delete_calendar_event(target)
     _save_meetings(meetings)
     return True, "Meeting cancelled."
