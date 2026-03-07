@@ -910,6 +910,13 @@ async def _auto_reply(payload: Dict[str, Any]) -> None:
                 wa_id = message.get("from")
                 if not wa_id or wa_id == business_phone_id:
                     continue
+                message_id = message.get("id")
+                if message_id:
+                    try:
+                        if not cache.mark_webhook(message_id):
+                            continue
+                    except Exception as exc:  # pylint: disable=broad-except
+                        print(f"REDIS DEDUPE ERROR ({message_id}): {exc}")
                 msg_type = message.get("type")
                 if msg_type == "text":
                     text_body = message.get("text", {}).get("body", "").strip()
@@ -1502,6 +1509,15 @@ def _create_meeting_record(
         record["meeting_provider"] = "google"
     meetings.append(record)
     _save_meetings(meetings)
+    try:
+        persistence.log_booking(
+            phone=client_wa,
+            meeting_time=slot_dt.isoformat(),
+            meeting_link=record.get("meet_link"),
+            status=record.get("status", "scheduled"),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"PG BOOKING LOG ERROR ({client_wa}): {exc}")
     return True, record
 
 
@@ -1549,6 +1565,15 @@ def _cancel_existing_meeting(client_wa: str, reason: str, admin_wa: str) -> tupl
     _delete_zoom_meeting(target)
     _delete_calendar_event(target)
     _save_meetings(meetings)
+    try:
+        persistence.log_booking(
+            phone=wa_id,
+            meeting_time=target.get("scheduled_at"),
+            meeting_link=target.get("meet_link"),
+            status=target.get("status", "cancelled"),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"PG BOOKING LOG ERROR ({wa_id}): {exc}")
     return True, "Meeting cancelled."
 
 
@@ -1688,6 +1713,15 @@ async def _handle_meeting_flow(wa_id: str, convo: Dict[str, Any], incoming_text:
             link = record.get("meet_link") or MEETING_LINK
             await _send_whatsapp_text(wa_id, f"{message} Join via {link}.", preview_url=False)
             convo.pop("meeting_flow", None)
+            try:
+                persistence.log_booking(
+                    phone=wa_id,
+                    meeting_time=slot_dt.isoformat(),
+                    meeting_link=link,
+                    status=record.get("status", "scheduled"),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"PG BOOKING LOG ERROR ({wa_id}): {exc}")
         else:
             await _send_whatsapp_text(wa_id, message, preview_url=False)
         return True
