@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from agents.lead_scoring import LeadInput, LeadScoringAgent
 from services.conversation_agent import ConversationAgent, ConversationAgentResult
+from services import cache, persistence
 
 app = FastAPI()
 
@@ -363,6 +364,9 @@ CANCEL_REASON_CHOICES = {
 
 scoring_agent = LeadScoringAgent()
 conversation_agent = ConversationAgent()
+SUMMARY_MODEL = os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
+SUMMARY_PROMPT = "Summarize the conversation below in 3 concise lines focusing only on user requirements and decisions."
+
 credentials_info = None
 credentials_json = os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
 if credentials_json:
@@ -1044,6 +1048,51 @@ async def _transcribe_audio_note(data: bytes, mime_type: str) -> str | None:
         return None
 
 
+async def _record_message(wa_id: str, role: str, message: str | None) -> None:
+    if not message:
+        return
+    try:
+        persistence.log_conversation(wa_id, role, message)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"PG LOG ERROR ({wa_id}): {exc}")
+    summary_batch = []
+    try:
+        _, summary_batch = cache.append_history(wa_id, role, message)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"REDIS HISTORY ERROR ({wa_id}): {exc}")
+    if summary_batch:
+        summary_text = await _summarize_overflow(summary_batch)
+        if summary_text:
+            try:
+                cache.append_summary(wa_id, summary_text)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"REDIS SUMMARY ERROR ({wa_id}): {exc}")
+
+
+async def _summarize_overflow(entries: List[Dict[str, str]]) -> str:
+    if not entries:
+        return ""
+    client = conversation_agent.client
+    if not client:
+        return ""
+    transcript = "\n".join(f"{item['role'].upper()}: {item['text']}" for item in entries if item.get('text'))
+    if not transcript:
+        return ""
+    try:
+        response = await client.responses.create(
+            model=SUMMARY_MODEL,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": SUMMARY_PROMPT}]},
+                {"role": "user", "content": [{"type": "input_text", "text": transcript}]},
+            ],
+        )
+        summary = conversation_agent._extract_text(response)  # type: ignore[attr-defined]
+        return summary.strip() if summary else ""
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"SUMMARY ERROR: {exc}")
+        return ""
+
+
 async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incoming_text: str) -> None:
     state = _load_state()
     convo = _load_or_create_convo(state, wa_id)
@@ -1101,6 +1150,8 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         detected_category = _detect_asset_category(incoming_text)
         if detected_category:
             convo["asset_upload_focus"] = detected_category
+
+        await _record_message(wa_id, "client", incoming_text)
 
     if _is_admin_wa(wa_id):
         handled_admin = await _process_admin_command(wa_id, incoming_text, state)
@@ -2861,7 +2912,9 @@ async def _send_whatsapp_text(to: str, message: str, preview_url: bool) -> Dict[
         resp = await client.post(url, json=payload, headers=headers)
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
+    result = resp.json()
+    await _record_message(to, "bot", message)
+    return result
 
 
 async def _intent_ready_to_book(wa_id: str, convo: Dict[str, Any]) -> bool:
