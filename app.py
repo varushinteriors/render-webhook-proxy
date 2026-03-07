@@ -622,12 +622,25 @@ YES_NO_RESPONSES = {
     "not yet",
 }
 
+AFFIRMATIVE_RESPONSES = {"yes", "y", "yeah", "yup", "sure", "of course", "definitely", "absolutely", "i do", "i have", "ready", "available"}
+
 INTENTS_THAT_SKIP_FORCED_PROMPT = {"smalltalk", "objection", "confusion"}
 GENTLE_RECOVERY_FIELDS = ["location", "project_type", "area"]
 
 
 def _normalize_text(value: str | None) -> str:
     return (value or "").strip()
+
+
+def _is_affirmative_response(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = value.strip().lower()
+    if not normalized:
+        return False
+    if normalized in AFFIRMATIVE_RESPONSES:
+        return True
+    return normalized.startswith("y")
 
 
 def _looks_like_objection(value: str) -> bool:
@@ -722,6 +735,8 @@ PHASE_VALUE_BUILD = "value_build"
 PHASE_BOOKING = "booking"
 PHASE_POST_BOOKING = "post_booking"
 
+STATUS_MEETING_PITCH = "meeting_pitch"
+
 MAX_HISTORY_LENGTH = 40
 ESCALATION_INTENTS = {"pricing_query"}
 ESCALATION_THRESHOLD = 2
@@ -749,6 +764,15 @@ MEETING_REMINDER_MESSAGES = {
     "one_hour": "One hour to go! This session is where we unpack the latest finishes, trend insights, and the smart moves that set premium homes apart. Join via {link} and expect your mindset to shift in the best way.",
     "ten_minutes": "Final countdown—10 minutes! Keep your excitement up because we’re about to dive into the details that turn good spaces into unforgettable ones. Join via {link} and let’s create something special.",
 }
+
+ASSET_UPLOAD_CONFIRMATION = (
+    "Great! Please upload the floor plan, site photos, or inspiration images right here—one file at a time—and I’ll organize them for our designer."
+)
+
+MEETING_PITCH_DECLINE_LIMIT = 2
+MEETING_OPT_IN_KEYWORDS = {"yes", "sure", "ok", "okay", "go ahead", "book", "schedule", "slot", "send slots", "lock it", "confirm", "do it", "share slots", "call", "meeting"}
+MEETING_DECLINE_KEYWORDS = {"no", "not now", "later", "maybe later", "not interested", "stop", "skip", "don't", "dont", "busy", "no thanks"}
+QUOTE_OBJECTION_KEYWORDS = {"quote", "pricing", "price", "estimate"}
 
 CANONICAL_LEAD_FIELDS = [
     "full_name",
@@ -1215,13 +1239,38 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         return
 
     active_meeting = _get_active_meeting_record(wa_id)
-    if active_meeting and _detect_cancel_request(incoming_text):
-        await _start_client_cancellation(wa_id, convo)
+    wants_cancel = bool(incoming_text and _detect_cancel_request(incoming_text))
+    wants_reschedule = bool(incoming_text and _detect_reschedule_request(incoming_text))
+    if wants_cancel:
+        if active_meeting:
+            await _start_client_cancellation(wa_id, convo)
+        else:
+            await _send_whatsapp_text(wa_id, "I don’t see a confirmed session to cancel yet. Once we lock a slot I can help you move it or drop it.", preview_url=False)
         state[wa_id] = convo
         _save_state(state)
         return
-    if active_meeting and _detect_reschedule_request(incoming_text):
-        await _start_client_reschedule(wa_id, convo)
+    if wants_reschedule:
+        if active_meeting:
+            await _start_client_reschedule(wa_id, convo)
+        else:
+            await _send_whatsapp_text(wa_id, "I’ll help you reschedule as soon as we confirm a slot. Want me to resend the available times?", preview_url=False)
+        state[wa_id] = convo
+        _save_state(state)
+        return
+
+    if convo.get("status") == STATUS_MEETING_PITCH and incoming_text:
+        handled_pitch = await _handle_meeting_pitch_reply(wa_id, convo, incoming_text)
+        if handled_pitch:
+            state[wa_id] = convo
+            _save_state(state)
+            return
+
+    if convo.get("meeting_pitch_paused") and incoming_text and _detect_meeting_opt_in(incoming_text):
+        _clear_meeting_pitch(convo)
+        convo["status"] = "awaiting_meeting"
+        await _send_meeting_prompt(wa_id, convo)
+        convo["awaiting_field"] = None
+        convo["awaiting_origin"] = None
         state[wa_id] = convo
         _save_state(state)
         return
@@ -1642,6 +1691,29 @@ def _detect_reschedule_request(text: str) -> bool:
     return any(keyword in lowered for keyword in ["resched", "change time", "another time", "move the meeting", "postpone"])
 
 
+def _detect_meeting_opt_in(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    if lowered in AFFIRMATIVE_RESPONSES:
+        return True
+    return any(keyword in lowered for keyword in MEETING_OPT_IN_KEYWORDS)
+
+
+def _detect_meeting_decline(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    return any(keyword in lowered for keyword in MEETING_DECLINE_KEYWORDS)
+
+
+def _detect_quote_pushback(text: str) -> bool:
+    lowered = text.lower()
+    if "quote" in lowered and ("now" in lowered or "here" in lowered or "right away" in lowered):
+        return True
+    return any(keyword in lowered for keyword in QUOTE_OBJECTION_KEYWORDS)
+
+
 async def _start_client_cancellation(wa_id: str, convo: Dict[str, Any]) -> None:
     convo["meeting_flow"] = {"mode": "cancel", "awaiting": "reason"}
     lines = [f"{num}. {info['label']}" for num, info in CANCEL_REASON_CHOICES.items()]
@@ -1879,6 +1951,10 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
         clarify_text = ", ".join(clarifications)
         reply_parts.append(f"Just to confirm, is {clarify_text} correct? If not, share the updated detail and I’ll fix it.")
 
+    if any(field == "assets" and _is_affirmative_response(value) for field, value in captured_updates) and not convo.get("asset_upload_prompted"):
+        reply_parts.append(ASSET_UPLOAD_CONFIRMATION)
+        convo["asset_upload_prompted"] = True
+
     bundle_prompt: str | None = None
     bundle_fields: List[str] = []
     if not skip_forced_follow and convo.get("phase") in {PHASE_DISCOVERY, PHASE_QUALIFICATION}:
@@ -1908,11 +1984,13 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     convo["awaiting_origin"] = "agent" if follow_field else None
 
     should_offer_meeting = (result.request_meeting and not requires_clarification) or (not _missing_fields(convo) and not requires_clarification)
-    if should_offer_meeting and convo.get("status") != "awaiting_meeting":
-        await _send_meeting_prompt(wa_id, convo)
-        convo["status"] = "awaiting_meeting"
-        convo["awaiting_field"] = None
-        convo["awaiting_origin"] = None
+    if should_offer_meeting:
+        has_active_meeting = bool(active_meeting)
+        if not has_active_meeting and convo.get("status") not in {"awaiting_meeting", STATUS_MEETING_PITCH} and not convo.get("meeting_pitch_paused"):
+            await _send_meeting_pitch(wa_id, convo)
+            convo["status"] = STATUS_MEETING_PITCH
+            convo["awaiting_field"] = None
+            convo["awaiting_origin"] = None
     _update_convo_phase(convo)
     state[wa_id] = convo
     _save_state(state)
@@ -2270,6 +2348,73 @@ def _phone_key_from_wa(wa_id: str) -> str | None:
     if key and len(key) > 10:
         return key[-10:]
     return key
+
+
+async def _send_meeting_pitch(wa_id: str, convo: Dict[str, Any]) -> None:
+    answers = convo.get("answers", {})
+    name = convo.get("contact_name") or answers.get("name") or "there"
+    parts = []
+    if answers.get("service_type"):
+        parts.append(answers.get("service_type").lower())
+    if answers.get("project_type"):
+        parts.append(answers.get("project_type"))
+    if answers.get("location"):
+        parts.append(f"in {answers.get('location')}")
+    if answers.get("area"):
+        parts.append(f"around {answers.get('area')} sq.ft")
+    context = ", ".join(parts)
+    intro = f"{name}, we now have the essentials" if not context else f"{name}, we now have the essentials for your {context}"
+    message = (
+        f"{intro}. How about a complimentary 10-min call with our lead designer? You’ll walk away with an instant realistic quote, fresh design ideas tailored to your layout, and a quick walkthrough of how our interior design process works—even if you don’t hire us. "
+        "Should I line up a slot for you?"
+    )
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
+    _append_history(convo, "bot", message)
+    convo["meeting_pitch_meta"] = {
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "declines": 0,
+    }
+    convo["meeting_pitch_paused"] = False
+
+
+def _clear_meeting_pitch(convo: Dict[str, Any]) -> None:
+    convo.pop("meeting_pitch_meta", None)
+    convo.pop("meeting_pitch_paused", None)
+
+
+async def _handle_meeting_pitch_reply(wa_id: str, convo: Dict[str, Any], incoming_text: str) -> bool:
+    if not incoming_text:
+        return False
+    if _detect_meeting_opt_in(incoming_text):
+        _clear_meeting_pitch(convo)
+        convo["status"] = "awaiting_meeting"
+        await _send_meeting_prompt(wa_id, convo)
+        return True
+    if _detect_quote_pushback(incoming_text):
+        message = (
+            "I’d love to text you a number, but walking through the quote over a quick call keeps it grounded in your plans, finishes, and scope. "
+            "Those 10 minutes give you context plus room to ask anything—shall we still line it up?"
+        )
+        await _send_whatsapp_text(wa_id, message, preview_url=False)
+        _append_history(convo, "bot", message)
+        return True
+    if _detect_meeting_decline(incoming_text):
+        meta = convo.setdefault("meeting_pitch_meta", {})
+        declines = meta.get("declines", 0) + 1
+        meta["declines"] = declines
+        message = (
+            "Totally your call, but those 10 minutes give you a no-pressure quote, project-specific ideas, and clarity on the process—even if you never hire us. "
+            "What’s holding you back? I can also look for a different day if timing is the issue."
+        )
+        if declines >= MEETING_PITCH_DECLINE_LIMIT:
+            message += "\n\nI’ll pause the scheduling push for now—ping me anytime if you change your mind."
+            convo["meeting_pitch_paused"] = True
+            convo["status"] = "active"
+            _clear_meeting_pitch(convo)
+        await _send_whatsapp_text(wa_id, message, preview_url=False)
+        _append_history(convo, "bot", message)
+        return True
+    return False
 
 
 async def _send_meeting_prompt(wa_id: str, convo: Dict[str, Any]) -> None:

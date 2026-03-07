@@ -18,7 +18,7 @@ ALLOWED_INTENTS = [
     "smalltalk",
     "unknown",
 ]
-INTAKE_FIELDS = ["name", "service_type", "location", "project_type", "area", "timeline", "finish", "budget"]
+INTAKE_FIELDS = ["name", "service_type", "location", "project_type", "area", "timeline", "finish", "budget", "assets", "portfolio"]
 SMALLTALK_KEYWORDS = ["hi", "hello", "hey", "good morning", "good evening", "thanks", "thank you", "ok", "okay", "nice", "cool", "hmm", "great"]
 FIELDS_SCHEMA_PROPERTIES = {field: {"type": "string"} for field in INTAKE_FIELDS}
 
@@ -29,11 +29,18 @@ SYSTEM_PROMPT = (
     'When basics are missing, feel free to bundle them (“Tell me the location, property type, and approximate size”) so the client can reply in one go. '
     'Extract as many useful details as you can from each message before asking anything else, and skip new questions entirely whenever the user is objecting or just making small talk. '
     'If you need an answer, set `next_field` plus a clear `follow_up_prompt`; otherwise leave both blank so the controller never invents a scripted prompt. '
-    'Ask at most one question per reply. ' 'Let the conversation flow naturally—never rapid-fire the full intake list. If the user expresses confusion or objects ("why so many questions?", "not hiring a designer"), set intent to objection or confusion, explain briefly why the detail helps, highlight the 45-day guarantee + direct factory-to-project delivery + our in-house expert designers, and only then offer a single gentle next step. '
+    'Ask at most one question per reply. '
+    'Let the conversation flow naturally—never rapid-fire the full intake list. If the user expresses confusion or objects ("why so many questions?", "not hiring a designer"), set intent to objection or confusion, explain briefly why the detail helps, highlight the 45-day guarantee + direct factory-to-project delivery + our in-house expert designers, and only then offer a single gentle next step. '
     'If your confidence in the interpretation is below 0.6, leave fields_detected empty, keep the intent as clarification or unknown, and craft a clarifying follow-up prompt before logging anything. '
     'For pricing queries, share general guidance and recommend a 10-min alignment call first; if they still insist on an exact quote, set needs_human=true with a clear handoff_reason. '
-    'For ask_portfolio, always include the provided portfolio link. When reconnecting with a returning client, start with a brief summary of the last discussion and ask whether they want to discuss a new project, edit the existing one, or continue from the last stage before proceeding. Keep replies under four sentences and avoid markdown.'
+    'For ask_portfolio, always include the provided portfolio link. When reconnecting with a returning client, start with a brief summary of the last discussion and ask whether they want to discuss a new project, edit the existing one, or continue from the last stage before proceeding. '
+    'If the client says they have layouts, floor plans, site photos, or inspiration images, acknowledge it and invite them to upload those files right away (one at a time) before moving on. '
+    'Before you set `request_meeting=true` or list slots, confirm they are open to a complimentary 10-min call with our lead designer, recap the benefits (instant realistic quote, layout-specific design ideas, quick interior design process walkthrough), and wait for an explicit yes. '
+    'If they hesitate or decline, politely ask what is holding them back, reassure them that the call is valuable even if they never hire us, and explain that quotes need context to make sense. '
+    'If the summary or phase indicates an upcoming session is already booked, do NOT pitch another call—reference the existing booking and handle their question instead. '
+    'Avoid repeating the exact same explanation twice; reference prior answers instead of copy/pasting yourself. Keep replies under four sentences and avoid markdown.'
 )
+
 
 RESPONSE_SCHEMA = {
     "name": "conversation_response",
@@ -142,6 +149,37 @@ class ConversationAgent:
             f"New client message: {message.strip()}"
         )
 
+
+        print("LLM CALL STARTED")
+        print(f"LLM USER MESSAGE: {message.strip()}")
+        print(f"LLM KNOWN ANSWERS: {answers_text}")
+        print(f"LLM MISSING FIELDS: {missing_text}")
+        print(f"LLM AWAITING FIELD: {awaiting_text}")
+        print(f"LLM PHASE: {phase_text}")
+        print(f"LLM SUMMARY: {summary_text}")
+        print(f"LLM MODEL USED: {self.model}")
+        try:
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": SYSTEM_PROMPT}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user_prompt}],
+                    },
+                ],
+                response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
+            )
+            print("LLM RESPONSE RECEIVED")
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"LLM ERROR: {exc}")
+            return None
+
+        content = self._extract_text(response)
+        print(f"LLM CONTENT: {content}")
         if not content:
             return None
         try:
