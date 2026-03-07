@@ -112,6 +112,8 @@ class ConversationAgent:
         contact_name: Optional[str],
         portfolio_link: str,
         phase: Optional[str],
+        summary: Optional[str] = None,
+        relevant_memory: Optional[List[str]] = None,
     ) -> Optional[ConversationAgentResult]:
         if not self.client:
             return None
@@ -121,7 +123,11 @@ class ConversationAgent:
         awaiting_text = awaiting_field or "none"
         name = contact_name or "there"
         smalltalk_hint = ", ".join(SMALLTALK_KEYWORDS)
+
+
         phase_text = phase or "discovery"
+        summary_text = summary.strip() if summary else "(no summary yet)"
+        context_block = "\n".join(f"- {item}" for item in (relevant_memory or [])) or "(no similar memories found)"
         user_prompt = (
             f"Client name: {name}\n"
             f"Known answers JSON: {answers_text}\n"
@@ -130,37 +136,12 @@ class ConversationAgent:
             f"Current phase: {phase_text}\n"
             f"Portfolio link: {portfolio_link}\n"
             f"Treat these keywords as pure smalltalk: {smalltalk_hint}.\n"
+            f"Conversation summary: {summary_text}\n"
+            f"Relevant prior context:\n{context_block}\n"
             f"Recent history (newest last):\n{history_text}\n\n"
             f"New client message: {message.strip()}"
         )
-        print("LLM CALL STARTED")
-        print(f"LLM USER MESSAGE: {message.strip()}")
-        print(f"LLM KNOWN ANSWERS: {answers_text}")
-        print(f"LLM MISSING FIELDS: {missing_text}")
-        print(f"LLM AWAITING FIELD: {awaiting_text}")
-        print(f"LLM PHASE: {phase_text}")
-        print(f"LLM MODEL USED: {self.model}")
-        try:
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
-                    {
-                        "role": "system",
-                        "content": [{"type": "input_text", "text": SYSTEM_PROMPT}],
-                    },
-                    {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": user_prompt}],
-                    },
-                ],
-            )
-            print("LLM RESPONSE RECEIVED")
-        except Exception as exc:  # pylint: disable=broad-except
-            print(f"LLM ERROR: {exc}")
-            return None
 
-        content = self._extract_text(response)
-        print(f"LLM CONTENT: {content}")
         if not content:
             return None
         try:

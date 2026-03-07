@@ -367,6 +367,8 @@ conversation_agent = ConversationAgent()
 SUMMARY_MODEL = os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
 SUMMARY_PROMPT = "Summarize the conversation below in 3 concise lines focusing only on user requirements and decisions."
 
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+
 credentials_info = None
 credentials_json = os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
 if credentials_json:
@@ -978,6 +980,7 @@ async def _handle_media_message(
         return
     data, mime_type, filename = download
     state = _load_state()
+    embedding_vector: list[float] | None = None
     convo = _load_or_create_convo(state, wa_id)
     contact_name = _match_contact_name(contacts, wa_id)
 
@@ -1048,13 +1051,21 @@ async def _transcribe_audio_note(data: bytes, mime_type: str) -> str | None:
         return None
 
 
-async def _record_message(wa_id: str, role: str, message: str | None) -> None:
+async def _record_message(wa_id: str, role: str, message: str | None) -> list[float] | None:
     if not message:
-        return
+        return None
     try:
         persistence.log_conversation(wa_id, role, message)
     except Exception as exc:  # pylint: disable=broad-except
         print(f"PG LOG ERROR ({wa_id}): {exc}")
+    embedding: list[float] | None = None
+    if role == "client":
+        embedding = await _embed_message(message)
+        if embedding:
+            try:
+                persistence.store_embedding(wa_id, message, embedding)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"PG EMBEDDING ERROR ({wa_id}): {exc}")
     summary_batch = []
     try:
         _, summary_batch = cache.append_history(wa_id, role, message)
@@ -1067,6 +1078,7 @@ async def _record_message(wa_id: str, role: str, message: str | None) -> None:
                 cache.append_summary(wa_id, summary_text)
             except Exception as exc:  # pylint: disable=broad-except
                 print(f"REDIS SUMMARY ERROR ({wa_id}): {exc}")
+    return embedding
 
 
 async def _summarize_overflow(entries: List[Dict[str, str]]) -> str:
@@ -1091,6 +1103,24 @@ async def _summarize_overflow(entries: List[Dict[str, str]]) -> str:
     except Exception as exc:  # pylint: disable=broad-except
         print(f"SUMMARY ERROR: {exc}")
         return ""
+
+
+async def _embed_message(message: str) -> list[float] | None:
+    if not message or not EMBEDDING_MODEL:
+        return None
+    client = conversation_agent.client
+    if not client:
+        return None
+    try:
+        response = await client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=message,
+        )
+        embedding = response.data[0].embedding if response.data else None
+        return embedding
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"EMBEDDING ERROR: {exc}")
+        return None
 
 
 async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incoming_text: str) -> None:
@@ -1151,7 +1181,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         if detected_category:
             convo["asset_upload_focus"] = detected_category
 
-        await _record_message(wa_id, "client", incoming_text)
+        embedding_vector = await _record_message(wa_id, "client", incoming_text)
 
     if _is_admin_wa(wa_id):
         handled_admin = await _process_admin_command(wa_id, incoming_text, state)
@@ -1222,9 +1252,34 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         await _run_legacy_flow(wa_id, convo, state)
         return
 
-    history_tail = convo.get("history", [])
+
+    session_snapshot: Dict[str, Any] = {}
+    try:
+        session_snapshot = cache.get_session(wa_id)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"REDIS SESSION ERROR ({wa_id}): {exc}")
+        session_snapshot = {}
+    redis_history = []
+    if session_snapshot:
+        try:
+            redis_history = json.loads(session_snapshot.get("recent_history", "[]"))
+        except json.JSONDecodeError:
+            redis_history = []
+    llm_history = [
+        {"from": ("client" if entry.get("role") == "client" else "bot"), "text": entry.get("text", "") }
+        for entry in redis_history
+        if entry.get("text")
+    ]
+    history_tail = llm_history if llm_history else convo.get("history", [])
     if history_tail:
         history_tail = history_tail[-5:]
+    summary_text = session_snapshot.get("summary", "") if session_snapshot else ""
+    relevant_memory: List[str] = []
+    if embedding_vector:
+        try:
+            relevant_memory = persistence.similar_messages(embedding_vector, limit=3)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"PG VECTOR SEARCH ERROR ({wa_id}): {exc}")
     agent_result = await conversation_agent.generate_response(
         answers=convo.get("answers", {}),
         missing_fields=_missing_fields(convo),
@@ -1234,6 +1289,8 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         contact_name=convo.get("contact_name"),
         portfolio_link=PORTFOLIO_LINK,
         phase=convo.get("phase"),
+        summary=summary_text,
+        relevant_memory=relevant_memory,
     )
 
     if not agent_result:
