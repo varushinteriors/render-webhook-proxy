@@ -110,6 +110,8 @@ def _get_calendar_service():
         return None
     try:
         info = json.loads(GOOGLE_CALENDAR_CREDENTIALS_JSON)
+        if "private_key" in info:
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
         creds = service_account.Credentials.from_service_account_info(info, scopes=CALENDAR_SCOPES)
         _CALENDAR_SERVICE = build("calendar", "v3", credentials=creds, cache_discovery=False)
     except Exception as exc:
