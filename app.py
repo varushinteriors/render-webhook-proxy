@@ -261,17 +261,20 @@ def _create_calendar_event(record: Dict[str, Any], slot_dt: datetime, client_nam
         "description": _render_calendar_description(record),
         "start": {"dateTime": slot_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
         "end": {"dateTime": end_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
-        "conferenceData": {
+    }
+    conference_kwargs = {}
+    if record.get("meeting_provider") != "zoom":
+        body["conferenceData"] = {
             "createRequest": {
                 "requestId": record["id"],
                 "conferenceSolutionKey": {"type": "hangoutsMeet"},
             }
-        },
-    }
+        }
+        conference_kwargs["conferenceDataVersion"] = 1
     try:
         event = (
             service.events()
-            .insert(calendarId=GOOGLE_CALENDAR_ID, body=body, conferenceDataVersion=1)
+            .insert(calendarId=GOOGLE_CALENDAR_ID, body=body, **conference_kwargs)
             .execute()
         )
         record["google_event_id"] = event.get("id")
@@ -292,6 +295,7 @@ def _update_calendar_event(record: Dict[str, Any], slot_dt: datetime) -> None:
         "end": {"dateTime": end_dt.astimezone(IST).isoformat(), "timeZone": "Asia/Kolkata"},
         "description": _render_calendar_description(record),
     }
+    conference_kwargs = {"conferenceDataVersion": 1} if record.get("meeting_provider") != "zoom" else {}
     try:
         event = (
             service.events()
@@ -299,7 +303,7 @@ def _update_calendar_event(record: Dict[str, Any], slot_dt: datetime) -> None:
                 calendarId=GOOGLE_CALENDAR_ID,
                 eventId=event_id,
                 body=body,
-                conferenceDataVersion=1,
+                **conference_kwargs,
             )
             .execute()
         )
