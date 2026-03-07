@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import mimetypes
 import os
@@ -66,9 +67,10 @@ LEAD_ACCESS_TOKEN = PAGE_ACCESS_TOKEN
 if not LEAD_ACCESS_TOKEN:
     print("ERROR: PAGE_ACCESS_TOKEN missing – leadgen fetch will fail")
 ADMIN_ALERT_NUMBERS = [n.strip() for n in os.getenv("ADMIN_ALERT_NUMBERS", "").split(",") if n.strip()]
-PORTFOLIO_LINK = os.getenv(
-    "DRIVE_PORTFOLIO_LINK",
-    "https://drive.google.com/drive/folders/1WBJf_7zCLb5XxpbryxCSoUiKc13DzerC",
+PORTFOLIO_LINK = (
+    os.getenv("PORTFOLIO_LINK")
+    or os.getenv("DRIVE_PORTFOLIO_LINK")
+    or "https://pub-a083917787a641dcb9ac60c1f3efe283.r2.dev/varush_portfolio/PORTFOLIO%20(1)%20(1).pdf"
 )
 GRAPH_API_BASE = "https://graph.facebook.com/v20.0"
 STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
@@ -407,10 +409,11 @@ def _r2_public_url(object_key: str) -> str | None:
     base = R2_PUBLIC_BASE_URL.rstrip("/")
     return f"{base}/{object_key}"
 
-def _upload_to_r2(wa_id: str, filename: str, mime_type: str, data: bytes) -> Dict[str, str] | None:
+def _upload_to_r2(wa_id: str, filename: str, mime_type: str, data: bytes, category: str | None = None) -> Dict[str, str] | None:
     if not r2_client:
         return None
-    object_key = f"{_r2_prefix_for_wa(wa_id)}/{filename}"
+    category_segment = f"{category}/" if category else ""
+    object_key = f"{_r2_prefix_for_wa(wa_id)}/{category_segment}{filename}"
     try:
         r2_client.put_object(
             Bucket=R2_BUCKET,
@@ -491,7 +494,13 @@ QUESTION_PROMPTS = {
     "timeline": "When are you planning to start? (Immediately, within 3 months, within 6 months?)",
     "finish": "What finish level would you like—budget-friendly, premium, or luxury?",
     "budget": "What budget bracket should we plan for? (<10 lacs, 10–20 lacs, 20–30 lacs, >30 lacs, or flexible as per design.)",
-    "assets": "Do you have any layouts or site photos you can share here?",
+    "assets": (
+        "Could you share any of the following?\n"
+        "• Layout plan / floor plan\n"
+        "• Site or current project photos\n"
+        "• Inspiration or mood-board images\n"
+        "Send whatever you have, one upload at a time, and I’ll organize them on your project board."
+    ),
     "portfolio": f"Would you like to see our latest work portfolio? Here’s a quick look: {PORTFOLIO_LINK}",
 }
 
@@ -925,6 +934,27 @@ def _ensure_convo_defaults(convo: Dict[str, Any]) -> Dict[str, Any]:
     return convo
 
 
+def _load_or_create_convo(state: Dict[str, Any], wa_id: str) -> Dict[str, Any]:
+    convo = state.get(wa_id)
+    if convo is None:
+        convo = {
+            "answers": {},
+            "awaiting_field": None,
+            "awaiting_origin": None,
+            "completed": False,
+            "has_welcomed": False,
+            "history": [],
+            "status": "active",
+            "escalations": {},
+            "has_recap_prompted": False,
+            "awaiting_recap_choice": False,
+            "last_recap_ts": 0.0,
+            "phase": PHASE_DISCOVERY,
+        }
+        state[wa_id] = convo
+    return _ensure_convo_defaults(convo)
+
+
 async def _handle_media_message(
     wa_id: str,
     msg_type: str,
@@ -943,43 +973,55 @@ async def _handle_media_message(
     if not download:
         return
     data, mime_type, filename = download
-    archive_path = _archive_media_locally(wa_id, filename, data)
-    storage_record = _upload_to_r2(wa_id, filename, mime_type, data)
+    state = _load_state()
+    convo = _load_or_create_convo(state, wa_id)
+    contact_name = _match_contact_name(contacts, wa_id)
+
+    caption = media_info.get("caption") or message.get("text", {}).get("body")
+    category = _detect_asset_category(caption) or convo.get("asset_upload_focus")
+    if msg_type == "audio":
+        category = "audio"
+
+    archive_path = _archive_media_locally(wa_id, filename, data, category)
+    storage_record = _upload_to_r2(wa_id, filename, mime_type, data, category)
     print(f"R2 UPLOAD RESULT: {storage_record}")
 
-    if storage_record:
-        ack = (
-            "Saved your file to your secure Varush project vault. "
-            "Feel free to keep sharing anything else that helps us design."
-        )
-    elif archive_path:
-        ack = (
-            "Got it and stored it safely on our end. I’ll sync it to your vault as soon as connectivity clears."
-        )
+    stored_entry = {
+        "category": category or "misc",
+        "filename": filename,
+        "local_path": str(archive_path) if archive_path else None,
+        "r2": storage_record,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    assets_log = convo.setdefault("assets_collected", {})
+    assets_log.setdefault(stored_entry["category"], []).append(stored_entry)
+    if category != "audio":
+        convo["asset_upload_focus"] = None
+    state[wa_id] = convo
+    _save_state(state)
+
+    category_label = ASSET_CATEGORY_LABELS.get(category, "file")
+    if storage_record or archive_path:
+        ack = f"Saved your {category_label} to your project vault. Send more whenever you’re ready."
     else:
         ack = (
             "Received your file—thank you! I’ll log it and keep things moving while our sync completes."
         )
     await _send_whatsapp_text(wa_id, ack, preview_url=False)
 
+    if msg_type == "audio":
+        transcript = await _transcribe_audio_note(data, mime_type)
+        if transcript:
+            await _handle_conversation_turn(wa_id, contact_name, transcript)
+
+
+async def _transcribe_audio_note(data: bytes, mime_type: str) -> str | None:
+    return None
+
 
 async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incoming_text: str) -> None:
     state = _load_state()
-    convo = state.get(wa_id, {
-        "answers": {},
-        "awaiting_field": None,
-        "awaiting_origin": None,
-        "completed": False,
-        "has_welcomed": False,
-        "history": [],
-        "status": "active",
-        "escalations": {},
-        "has_recap_prompted": False,
-        "awaiting_recap_choice": False,
-        "last_recap_ts": 0.0,
-        "phase": PHASE_DISCOVERY,
-    })
-    convo = _ensure_convo_defaults(convo)
+    convo = _load_or_create_convo(state, wa_id)
     if _is_test_wa(wa_id):
         convo["is_test"] = True
 
@@ -1031,6 +1073,9 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
 
     if incoming_text:
         _append_history(convo, "client", incoming_text)
+        detected_category = _detect_asset_category(incoming_text)
+        if detected_category:
+            convo["asset_upload_focus"] = detected_category
 
     if _is_admin_wa(wa_id):
         handled_admin = await _process_admin_command(wa_id, incoming_text, state)
@@ -1592,6 +1637,9 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     if intent not in {"objection", "confusion"}:
         _reset_reassurance_streak(convo)
 
+    captured_updates: List[tuple[str, str]] = []
+    uncertain_fields: List[tuple[str, str]] = []
+
     if intent not in {"smalltalk", "objection", "confusion"} and not requires_clarification:
         for field, value in (result.fields_detected or {}).items():
             if field not in allowed_fields or value is None:
@@ -1604,6 +1652,9 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
             answers[field] = cleaned
             if field == "name" and not convo.get("contact_name"):
                 convo["contact_name"] = cleaned
+            captured_updates.append((field, cleaned))
+            if _needs_value_confirmation(field, cleaned):
+                uncertain_fields.append((field, cleaned))
 
     missing_fields = _missing_fields(convo)
     next_field = None
@@ -1646,6 +1697,20 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
         reply_text = f"{reply_text}\n\n{portfolio_line}".strip() if reply_text else portfolio_line
     if reply_text:
         reply_parts.append(reply_text)
+    if captured_updates:
+        summary_lines = []
+        for field, value in captured_updates:
+            label = SUMMARY_FIELD_LABELS.get(field, field.replace("_", " ").title())
+            summary_lines.append(f"{label}: {value}")
+        summary_text = "; ".join(summary_lines)
+        reply_parts.append(f"Noted — {summary_text}. Need to tweak anything? Just let me know.")
+    if uncertain_fields:
+        clarifications = []
+        for field, value in uncertain_fields:
+            label = SUMMARY_FIELD_LABELS.get(field, field.replace("_", " ").title())
+            clarifications.append(f"{label} '{value}'")
+        clarify_text = ", ".join(clarifications)
+        reply_parts.append(f"Just to confirm, is {clarify_text} correct? If not, share the updated detail and I’ll fix it.")
 
     bundle_prompt: str | None = None
     bundle_fields: List[str] = []
@@ -1937,6 +2002,45 @@ async def _send_portfolio_link(wa_id: str, convo: Dict[str, Any]) -> None:
     message = f"Here’s our latest work portfolio: {PORTFOLIO_LINK}"
     await _send_whatsapp_text(wa_id, message, preview_url=True)
     _append_history(convo, "bot", message)
+
+
+ASSET_CATEGORY_KEYWORDS = {
+    "layout": ["layout", "floor plan", "plan", "drawing"],
+    "site": ["site", "project", "current pics", "photos", "pics", "image"],
+    "inspiration": ["inspiration", "mood", "reference", "idea", "style"],
+}
+
+ASSET_CATEGORY_LABELS = {
+    "layout": "layout plan",
+    "site": "site/project photos",
+    "inspiration": "inspiration pics",
+    "audio": "voice note",
+    None: "file",
+}
+
+
+def _detect_asset_category(text: str | None) -> str | None:
+    if not text:
+        return None
+    lowered = text.lower()
+    for category, keywords in ASSET_CATEGORY_KEYWORDS.items():
+        if any(keyword in lowered for keyword in keywords):
+            return category
+    return None
+
+
+SUSPECT_VALUE_TOKENS = {"?", "??", "idk", "i dont know", "i don't know", "dont know", "don't know", "na", "n/a"}
+
+
+def _needs_value_confirmation(field: str, value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in SUSPECT_VALUE_TOKENS:
+        return True
+    if field in {"area", "budget"} and not any(ch.isdigit() for ch in value):
+        return True
+    if field == "location" and len(value.strip()) < 3:
+        return True
+    return False
 
 
 def _build_welcome_message(convo: Dict[str, Any]) -> str:
@@ -2414,12 +2518,12 @@ async def _download_whatsapp_media(media_id: str, media_info: Dict[str, Any] | N
 
 
 
-def _archive_media_locally(wa_id: str, filename: str, data: bytes) -> Path | None:
+def _archive_media_locally(wa_id: str, filename: str, data: bytes, category: str | None = None) -> Path | None:
     try:
         key = _phone_key_from_wa(wa_id) or wa_id
         safe_name = _sanitize_filename(filename)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        folder = MEDIA_ARCHIVE_PATH / key
+        folder = MEDIA_ARCHIVE_PATH / key / (category or "misc")
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"{timestamp}_{safe_name}"
         path.write_bytes(data)
