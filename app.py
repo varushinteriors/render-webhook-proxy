@@ -2,7 +2,7 @@ import asyncio
 import json
 import mimetypes
 import os
-import time
+import time as time_module
 from collections import deque
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -117,7 +117,7 @@ def _get_zoom_access_token() -> str | None:
     global _ZOOM_ACCESS_TOKEN, _ZOOM_TOKEN_EXPIRY
     if not _zoom_enabled():
         return None
-    now = time.time()
+    now = time_module.time()
     if _ZOOM_ACCESS_TOKEN and now < _ZOOM_TOKEN_EXPIRY:
         return _ZOOM_ACCESS_TOKEN
     try:
