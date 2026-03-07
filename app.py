@@ -1101,11 +1101,14 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         await _run_legacy_flow(wa_id, convo, state)
         return
 
+    history_tail = convo.get("history", [])
+    if history_tail:
+        history_tail = history_tail[-5:]
     agent_result = await conversation_agent.generate_response(
         answers=convo.get("answers", {}),
         missing_fields=_missing_fields(convo),
         awaiting_field=convo.get("awaiting_field"),
-        history=convo.get("history", []),
+        history=history_tail,
         message=incoming_text,
         contact_name=convo.get("contact_name"),
         portfolio_link=PORTFOLIO_LINK,
