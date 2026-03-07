@@ -1066,13 +1066,18 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         return
 
     if convo.get("completed"):
-        ack = _build_followup_ack(convo)
-        await _send_whatsapp_text(wa_id, ack, preview_url=False)
-        _append_history(convo, "bot", ack)
-        state[wa_id] = convo
-        _save_state(state)
-        _score_lead_from_conversation(wa_id, convo)
-        return
+        if _should_resume_after_completion(incoming_text):
+            convo["completed"] = False
+            convo["status"] = "active"
+            convo.pop("meeting_offer", None)
+        else:
+            ack = _build_followup_ack(convo)
+            await _send_whatsapp_text(wa_id, ack, preview_url=False)
+            _append_history(convo, "bot", ack)
+            state[wa_id] = convo
+            _save_state(state)
+            _score_lead_from_conversation(wa_id, convo)
+            return
 
     if not conversation_agent.is_ready:
         await _run_legacy_flow(wa_id, convo, state)
@@ -1819,6 +1824,33 @@ def _build_edit_summary(convo: Dict[str, Any]) -> str:
         value = answers.get(field) or "—"
         lines.append(f"• {label}: {value}")
     return "Here’s what I have so far:\n" + "\n".join(lines)
+
+
+POST_COMPLETION_ACKS = {
+    "ok",
+    "okay",
+    "thanks",
+    "thank you",
+    "thx",
+    "tnx",
+    "k",
+    "kk",
+    "cool",
+    "great",
+    "awesome",
+    "done",
+    "got it",
+}
+
+
+def _should_resume_after_completion(message: str | None) -> bool:
+    if not message:
+        return False
+    normalized = message.strip().lower()
+    if not normalized:
+        return False
+    normalized = normalized.strip(".!? ")
+    return normalized not in POST_COMPLETION_ACKS
 
 
 def _update_convo_phase(convo: Dict[str, Any]) -> str:
