@@ -1015,8 +1015,33 @@ async def _handle_media_message(
             await _handle_conversation_turn(wa_id, contact_name, transcript)
 
 
+def _audio_extension_for_mime(mime_type: str) -> str:
+    if "ogg" in mime_type:
+        return "ogg"
+    if "mpeg" in mime_type or "mp3" in mime_type:
+        return "mp3"
+    if "wav" in mime_type:
+        return "wav"
+    return "mp3"
+
+
 async def _transcribe_audio_note(data: bytes, mime_type: str) -> str | None:
-    return None
+    client = conversation_agent.client
+    if not client:
+        return None
+    model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+    audio_file = io.BytesIO(data)
+    audio_file.name = f"audio.{_audio_extension_for_mime(mime_type)}"
+    try:
+        response = await client.audio.transcriptions.create(
+            model=model,
+            file=audio_file,
+        )
+        text = getattr(response, "text", "") or ""
+        return text.strip() or None
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"AUDIO TRANSCRIBE ERROR: {exc}")
+        return None
 
 
 async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incoming_text: str) -> None:
