@@ -2,6 +2,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import time as time_module
 from collections import deque
 from datetime import date, datetime, time, timedelta, timezone
@@ -345,6 +346,7 @@ FIXED_HOLIDAY_MM_DD = {
     "12-25",  # Christmas
 }
 MEETING_SLOT_MINUTES = 10
+GENTLE_REASSURANCE_THRESHOLD = 3
 MEETING_PREP_BUFFER_MINUTES = 30
 MEETING_POST_BUFFER_MINUTES = 30
 MEETING_LOOKAHEAD_DAYS = 21
@@ -1037,9 +1039,21 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
             _save_state(state)
             return
 
+    if incoming_text and _is_portfolio_request(incoming_text):
+        await _send_portfolio_link(wa_id, convo)
+        state[wa_id] = convo
+        _save_state(state)
+        return
+
     if await _handle_meeting_flow(wa_id, convo, incoming_text):
         state[wa_id] = convo
         _save_state(state)
+        return
+
+    if await _handle_meeting_offer_selection(wa_id, convo, incoming_text):
+        state[wa_id] = convo
+        _save_state(state)
+        _score_lead_from_conversation(wa_id, convo)
         return
 
     active_meeting = _get_active_meeting_record(wa_id)
@@ -1515,6 +1529,23 @@ def _select_slot_from_message(text: str, slots: List[Dict[str, str]]) -> Dict[st
         idx = int(stripped) - 1
         if 0 <= idx < len(slots):
             return slots[idx]
+    match = re.search(r"\b(\d+)\b", stripped)
+    if match:
+        idx = int(match.group(1)) - 1
+        if 0 <= idx < len(slots):
+            return slots[idx]
+    lowered = stripped.lower()
+    for slot in slots:
+        label = (slot.get("label") or "").lower()
+        if label and label in lowered:
+            return slot
+        time_fragment = label.split("·")[-1].strip() if label else ""
+        if time_fragment and time_fragment.lower() in lowered:
+            return slot
+        if time_fragment:
+            simple_time = " ".join(time_fragment.split()[:2]).lower()
+            if simple_time and simple_time in lowered:
+                return slot
     return None
 
 
@@ -1528,8 +1559,7 @@ async def _run_legacy_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, A
                 _append_history(convo, "bot", welcome)
             convo["has_welcomed"] = True
         await _send_meeting_prompt(wa_id, convo)
-        convo["completed"] = True
-        convo["status"] = "completed"
+        convo["status"] = "awaiting_meeting"
         convo["awaiting_field"] = None
         convo["awaiting_origin"] = None
     else:
@@ -1555,6 +1585,9 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     intent = (result.intent or "unknown").lower()
     confidence = result.confidence if result.confidence is not None else 1.0
     requires_clarification = (confidence < CONFIDENCE_MIN_SCORE and intent not in {"smalltalk"}) or intent == "unknown"
+
+    if intent not in {"objection", "confusion"}:
+        _reset_reassurance_streak(convo)
 
     if intent not in {"smalltalk", "objection", "confusion"} and not requires_clarification:
         for field, value in (result.fields_detected or {}).items():
@@ -1640,10 +1673,11 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     convo["awaiting_origin"] = "agent" if follow_field else None
 
     should_offer_meeting = (result.request_meeting and not requires_clarification) or (not _missing_fields(convo) and not requires_clarification)
-    if should_offer_meeting and not convo.get("completed"):
+    if should_offer_meeting and convo.get("status") != "awaiting_meeting":
         await _send_meeting_prompt(wa_id, convo)
-        convo["completed"] = True
-        convo["status"] = "completed"
+        convo["status"] = "awaiting_meeting"
+        convo["awaiting_field"] = None
+        convo["awaiting_origin"] = None
     _update_convo_phase(convo)
     state[wa_id] = convo
     _save_state(state)
@@ -1719,8 +1753,8 @@ async def _process_recap_choice(wa_id: str, convo: Dict[str, Any], incoming_text
     await _send_whatsapp_text(wa_id, message, preview_url=False)
     _append_history(convo, "bot", message)
     await _send_meeting_prompt(wa_id, convo)
-    convo["status"] = "completed"
-    convo["completed"] = True
+    convo["status"] = "awaiting_meeting"
+    convo["completed"] = False
     return True
 
 
@@ -1880,6 +1914,28 @@ def _build_followup_ack(convo: Dict[str, Any]) -> str:
     )
 
 
+def _reset_reassurance_streak(convo: Dict[str, Any]) -> None:
+    convo["gentle_reassurance_streak"] = 0
+
+
+def _increment_reassurance_streak(convo: Dict[str, Any]) -> int:
+    streak = convo.get("gentle_reassurance_streak", 0) + 1
+    convo["gentle_reassurance_streak"] = streak
+    return streak
+
+
+def _is_portfolio_request(text: str | None) -> bool:
+    if not text:
+        return False
+    return "portfolio" in text.lower()
+
+
+async def _send_portfolio_link(wa_id: str, convo: Dict[str, Any]) -> None:
+    message = f"Here’s our latest work portfolio: {PORTFOLIO_LINK}"
+    await _send_whatsapp_text(wa_id, message, preview_url=True)
+    _append_history(convo, "bot", message)
+
+
 def _build_welcome_message(convo: Dict[str, Any]) -> str:
     name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
     answers = convo.get("answers", {})
@@ -1962,6 +2018,33 @@ async def _send_meeting_prompt(wa_id: str, convo: Dict[str, Any]) -> None:
     offer = convo.setdefault("meeting_offer", {})
     offer["sent_at"] = datetime.now(timezone.utc).isoformat()
     offer["slots"] = slots
+
+
+async def _handle_meeting_offer_selection(wa_id: str, convo: Dict[str, Any], incoming_text: str | None) -> bool:
+    offer = convo.get("meeting_offer") or {}
+    slots = offer.get("slots") or []
+    if not slots or not incoming_text:
+        return False
+    selection = _select_slot_from_message(incoming_text, slots)
+    if not selection:
+        return False
+    slot_dt = datetime.fromisoformat(selection["start"]).astimezone(IST)
+    client_name = convo.get("contact_name") or convo.get("answers", {}).get("name")
+    success, payload = _create_meeting_record(wa_id, slot_dt, None, "auto", client_name)
+    if not success:
+        await _send_whatsapp_text(wa_id, str(payload), preview_url=False)
+        return True
+    record = payload
+    link = record.get("meet_link") or MEETING_LINK
+    message = f"Locked {selection['label']}. Join via {link}."
+    await _send_whatsapp_text(wa_id, message, preview_url=True)
+    _append_history(convo, "bot", message)
+    convo["meeting_offer"] = {}
+    convo["completed"] = True
+    convo["status"] = "completed"
+    convo["awaiting_field"] = None
+    convo["awaiting_origin"] = None
+    return True
 
 
 async def _inactivity_watcher() -> None:
@@ -2651,8 +2734,9 @@ async def _send_whatsapp_text(to: str, message: str, preview_url: bool) -> Dict[
 
 async def _intent_ready_to_book(wa_id: str, convo: Dict[str, Any]) -> bool:
     await _send_meeting_prompt(wa_id, convo)
-    convo["completed"] = True
-    convo["status"] = "completed"
+    convo["status"] = "awaiting_meeting"
+    convo["awaiting_field"] = None
+    convo["awaiting_origin"] = None
     _update_convo_phase(convo)
     return True
 
@@ -2678,10 +2762,28 @@ async def _intent_smalltalk(wa_id: str, convo: Dict[str, Any]) -> bool:
 
 
 async def _intent_objection(wa_id: str, convo: Dict[str, Any]) -> bool:
+    streak = _increment_reassurance_streak(convo)
+    if streak >= GENTLE_REASSURANCE_THRESHOLD:
+        convo["status"] = "handoff"
+        convo["inactivity_paused"] = True
+        convo["awaiting_field"] = None
+        convo["awaiting_origin"] = None
+        convo["handoff_reason"] = "objection_loop"
+        await _announce_handoff(wa_id, convo, convo.get("handoff_reason"))
+        return True
     return await _send_gentle_reassurance(wa_id, convo)
 
 
 async def _intent_confusion(wa_id: str, convo: Dict[str, Any]) -> bool:
+    streak = _increment_reassurance_streak(convo)
+    if streak >= GENTLE_REASSURANCE_THRESHOLD:
+        convo["status"] = "handoff"
+        convo["inactivity_paused"] = True
+        convo["awaiting_field"] = None
+        convo["awaiting_origin"] = None
+        convo["handoff_reason"] = "confusion_loop"
+        await _announce_handoff(wa_id, convo, convo.get("handoff_reason"))
+        return True
     return await _send_gentle_reassurance(wa_id, convo)
 
 
