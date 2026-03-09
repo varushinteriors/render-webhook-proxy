@@ -73,12 +73,15 @@ PORTFOLIO_LINK = (
     or os.getenv("DRIVE_PORTFOLIO_LINK")
     or "https://pub-a083917787a641dcb9ac60c1f3efe283.r2.dev/varush_portfolio/PORTFOLIO%20(1)%20(1).pdf"
 )
+WHATSAPP_TEMPLATE_LANG = os.getenv("WHATSAPP_TEMPLATE_LANG", "en_US")
+LEAD_TEMPLATE_WELCOME = os.getenv("LEAD_TEMPLATE_WELCOME", "first_message_lead_welcome")
 GRAPH_API_BASE = "https://graph.facebook.com/v20.0"
 STATE_PATH = Path(os.getenv("STATE_PATH", "logs/conversations.json"))
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MEETING_LINK = os.getenv("MEETING_LINK", "https://meet.varushinteriors.com/intro")
 MEET_LINK_TEMPLATE = os.getenv("MEET_LINK_TEMPLATE", MEETING_LINK)
 ZOOM_ACCOUNT_ID = os.getenv("ZOOM_ACCOUNT_ID", "").strip()
+_LAST_INGEST_TS: datetime | None = None
 ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID", "").strip()
 ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET", "").strip()
 ZOOM_USER_ID = os.getenv("ZOOM_USER_ID", "me").strip()
@@ -917,6 +920,20 @@ async def service_status():
     }
 
 
+@app.get("/health/ingestion")
+async def ingestion_health():
+    postgres_ok = persistence.health_check()
+    redis_ok = cache.health_check()
+    embedding_ok = conversation_agent.is_ready
+    last_ts = _LAST_INGEST_TS.isoformat() if _LAST_INGEST_TS else None
+    return {
+        "postgres_ok": postgres_ok,
+        "redis_ok": redis_ok,
+        "embedding_worker_ok": embedding_ok,
+        "last_message_ts": last_ts,
+    }
+
+
 async def _auto_reply(payload: Dict[str, Any]) -> None:
     entries = payload.get("entry", [])
     for entry in entries:
@@ -1082,22 +1099,58 @@ async def _transcribe_audio_note(data: bytes, mime_type: str) -> str | None:
         return None
 
 
-async def _record_message(wa_id: str, role: str, message: str | None) -> list[float] | None:
+async def _record_message(
+    wa_id: str,
+    role: str,
+    message: str | None,
+    *,
+    contact_name: str | None = None,
+    embedding_task: asyncio.Task | None = None,
+) -> None:
     if not message:
         return None
+    phone = _normalize_phone(wa_id) or wa_id
+    timestamp = datetime.now(timezone.utc)
+    global _LAST_INGEST_TS  # pylint: disable=global-statement
+    _LAST_INGEST_TS = timestamp
+    lead_id: int | None = None
+    conversation_id: int | None = None
+
     try:
-        persistence.log_conversation(wa_id, role, message)
+        lead_id = persistence.upsert_lead(phone=phone, name=contact_name)
+        print(f"[INGEST] Lead upserted (phone={phone}, lead_id={lead_id})")
     except Exception as exc:  # pylint: disable=broad-except
-        print(f"PG LOG ERROR ({wa_id}): {exc}")
-    embedding: list[float] | None = None
-    if role == "client":
-        embedding = await _embed_message(message)
-        if embedding:
-            try:
-                persistence.store_embedding(wa_id, message, embedding)
-            except Exception as exc:  # pylint: disable=broad-except
-                print(f"PG EMBEDDING ERROR ({wa_id}): {exc}")
-    summary_batch = []
+        print(f"[INGEST][ERROR] Lead upsert failed ({phone}): {exc}")
+
+    if lead_id:
+        try:
+            conversation_id = persistence.ensure_conversation(lead_id)
+            print(f"[INGEST] Conversation ready (lead_id={lead_id}, conversation_id={conversation_id})")
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[INGEST][ERROR] Conversation ensure failed (lead_id={lead_id}): {exc}")
+
+    if conversation_id:
+        try:
+            persistence.insert_message(conversation_id, role, message, sent_at=timestamp)
+            print(f"[INGEST] Postgres stored (conversation_id={conversation_id})")
+            persistence.update_conversation(conversation_id, message, timestamp, role)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[INGEST][ERROR] Postgres message persistence failed ({phone}): {exc}")
+
+    try:
+        cache.update_realtime_message(
+            phone,
+            message,
+            timestamp,
+            role,
+            conversation_id=conversation_id,
+            lead_id=lead_id,
+        )
+        print(f"[INGEST] Redis updated (phone={phone})")
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[INGEST][ERROR] Redis cache update failed ({phone}): {exc}")
+
+    summary_batch: list[dict[str, str]] = []
     try:
         _, summary_batch = cache.append_history(wa_id, role, message)
     except Exception as exc:  # pylint: disable=broad-except
@@ -1109,7 +1162,42 @@ async def _record_message(wa_id: str, role: str, message: str | None) -> list[fl
                 cache.append_summary(wa_id, summary_text)
             except Exception as exc:  # pylint: disable=broad-except
                 print(f"REDIS SUMMARY ERROR ({wa_id}): {exc}")
-    return embedding
+
+    if role == "client":
+        _schedule_embedding_storage(phone, message, embedding_task=embedding_task)
+    return None
+
+
+def _schedule_embedding_storage(
+    phone: str,
+    message: str,
+    *,
+    embedding_task: asyncio.Task | None = None,
+) -> None:
+    async def _run() -> None:
+        embedding: list[float] | None = None
+        try:
+            if embedding_task:
+                embedding = await embedding_task
+            else:
+                embedding = await _embed_message(message)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[INGEST][ERROR] Embedding generation failed ({phone}): {exc}")
+            return
+        if not embedding:
+            return
+        try:
+            await asyncio.to_thread(persistence.store_embedding, phone, message, embedding)
+            print(f"[INGEST] Embedding stored (phone={phone})")
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[INGEST][ERROR] Embedding store failed ({phone}): {exc}")
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_run())
+        print(f"[INGEST] Embedding task scheduled (phone={phone})")
+    except RuntimeError:
+        asyncio.run(_run())
 
 
 async def _summarize_overflow(entries: List[Dict[str, str]]) -> str:
@@ -1206,13 +1294,29 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
 
     _hydrate_state_from_lead(wa_id, convo)
 
+    embedding_task: asyncio.Task | None = None
     if incoming_text:
         _append_history(convo, "client", incoming_text)
+        print(f"[INGEST] JSON written (phone={wa_id})")
         detected_category = _detect_asset_category(incoming_text)
         if detected_category:
             convo["asset_upload_focus"] = detected_category
 
-        embedding_vector = await _record_message(wa_id, "client", incoming_text)
+        embedding_task = asyncio.create_task(_embed_message(incoming_text))
+        await _record_message(
+            wa_id,
+            "client",
+            incoming_text,
+            contact_name=convo.get("contact_name"),
+            embedding_task=embedding_task,
+        )
+
+        if convo.get("lead_context_pending"):
+            await _send_leadgen_recap_prompt(wa_id, convo)
+            convo["lead_context_pending"] = False
+            state[wa_id] = convo
+            _save_state(state)
+            return
 
     if _is_admin_wa(wa_id):
         handled_admin = await _process_admin_command(wa_id, incoming_text, state)
@@ -1309,6 +1413,14 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         return
 
 
+    embedding_vector: list[float] | None = None
+    if embedding_task:
+        try:
+            embedding_vector = await embedding_task
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"EMBEDDING ERROR ({wa_id}): {exc}")
+            embedding_vector = None
+
     session_snapshot: Dict[str, Any] = {}
     try:
         session_snapshot = cache.get_session(wa_id)
@@ -1333,7 +1445,7 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
     relevant_memory: List[str] = []
     if embedding_vector:
         try:
-            relevant_memory = persistence.similar_messages(embedding_vector, limit=3)
+            relevant_memory = persistence.similar_messages(embedding_vector, limit=5)
         except Exception as exc:  # pylint: disable=broad-except
             print(f"PG VECTOR SEARCH ERROR ({wa_id}): {exc}")
     agent_result = await conversation_agent.generate_response(
@@ -1995,6 +2107,68 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
     state[wa_id] = convo
     _save_state(state)
     _score_lead_from_conversation(wa_id, convo)
+
+
+def _leadgen_known_info(convo: Dict[str, Any]) -> list[str]:
+    # Prefer canonical leadgen snapshot if available; fall back to answers.
+    canonical = convo.get("lead_canonical") or {}
+    answers = convo.get("answers") or {}
+
+    def valid(field: str, value: str | None) -> bool:
+        text = _normalize_text(value)
+        return _is_valid_field_value(field, text)
+
+    lines: list[str] = []
+    name = (convo.get("contact_name") or canonical.get("full_name") or answers.get("name"))
+    if name and valid("name", name):
+        lines.append(f"Name: {name}")
+
+    service_type = answers.get("service_type") or canonical.get("service_type")
+    if service_type and valid("service_type", service_type):
+        lines.append(f"Service: {service_type}")
+
+    location = answers.get("location") or canonical.get("project_location")
+    if location and valid("location", location):
+        lines.append(f"Location: {location}")
+
+    project_type = answers.get("project_type") or canonical.get("project_type")
+    if project_type and valid("project_type", project_type):
+        lines.append(f"Property: {project_type}")
+
+    area = answers.get("area") or canonical.get("area_sqft")
+    if area and valid("area", area):
+        lines.append(f"Area: {area}")
+
+    budget = answers.get("budget") or canonical.get("budget_bracket")
+    if budget and valid("budget", budget):
+        lines.append(f"Budget: {budget}")
+
+    timeline = answers.get("timeline") or canonical.get("timeline")
+    if timeline and valid("timeline", timeline):
+        lines.append(f"Timeline: {timeline}")
+
+    return lines
+
+
+async def _send_leadgen_recap_prompt(wa_id: str, convo: Dict[str, Any]) -> None:
+    name = convo.get("contact_name") or (convo.get("lead_canonical") or {}).get("full_name") or "there"
+    info_lines = _leadgen_known_info(convo)
+    info_block = "\n".join(f"• {line}" for line in info_lines) if info_lines else ""
+
+    intro = f"Hi {name}! Welcome to Varush Architect & Interiors." if name else "Welcome to Varush Architect & Interiors."
+    recap_text = intro
+    if info_block:
+        recap_text += f"\n\nHere’s what we already have from your form:\n{info_block}"
+    recap_text += (
+        "\n\nWould you like to proceed from here, edit anything, or start afresh? "
+        "Reply with 'continue', 'edit', or 'new'."
+    )
+
+    await _send_whatsapp_text(wa_id, recap_text, preview_url=False)
+    _append_history(convo, "bot", recap_text)
+    convo["awaiting_recap_choice"] = True
+    convo["has_recap_prompted"] = True
+    convo["last_recap_ts"] = datetime.now(timezone.utc).timestamp()
 
 
 async def _send_recap_prompt(wa_id: str, convo: Dict[str, Any], now_ts: float) -> None:
@@ -2738,6 +2912,39 @@ def _store_lead_index(details: Dict[str, Any]) -> None:
     _save_lead_index(index)
 
 
+def _mark_lead_context_pending(details: Dict[str, Any]) -> None:
+    canonical = details.get("canonical") or {}
+    phone = _normalize_phone(canonical.get("phone"))
+    if not phone:
+        return
+    # State keys are WA IDs; for leadgen we normalize to digits (typically includes country code)
+    state = _load_state()
+    convo = _load_or_create_convo(state, phone)
+    convo["lead_context_pending"] = True
+    convo["lead_context_received_at"] = datetime.now(timezone.utc).isoformat()
+    convo["lead_canonical"] = canonical
+    full_name = canonical.get("full_name")
+    if full_name and not convo.get("contact_name"):
+        convo["contact_name"] = full_name
+    state[phone] = convo
+    _save_state(state)
+    print(f"[LEADGEN] Lead context pending set (phone={phone})")
+
+
+async def _send_lead_welcome_template(details: Dict[str, Any]) -> None:
+    canonical = details.get("canonical") or {}
+    phone = _normalize_phone(canonical.get("phone"))
+    if not phone:
+        return
+    name = (canonical.get("full_name") or canonical.get("client_name") or "there").strip() or "there"
+    try:
+        await _send_whatsapp_template(phone, LEAD_TEMPLATE_WELCOME, name)
+        print(f"[LEADGEN] Template sent: {LEAD_TEMPLATE_WELCOME} (phone={phone})")
+    except Exception as exc:  # pylint: disable=broad-except
+        # Never break leadgen webhook flow.
+        print(f"[LEADGEN][ERROR] Welcome template failed (phone={phone}): {exc}")
+
+
 def _score_lead_from_canonical(details: Dict[str, Any]) -> None:
     canonical = details.get("canonical") or {}
     phone = canonical.get("phone")
@@ -3053,6 +3260,8 @@ async def _process_leadgen_payload(payload: Dict[str, Any]) -> None:
                 _store_lead_index(details)
                 _score_lead_from_canonical(details)
                 await _notify_admins_of_lead(details)
+                _mark_lead_context_pending(details)
+                await _send_lead_welcome_template(details)
 
 
 async def _fetch_lead_details(lead_id: str) -> Dict[str, Any] | None:
@@ -3151,6 +3360,42 @@ async def _send_whatsapp_text(to: str, message: str, preview_url: bool) -> Dict[
     result = resp.json()
     await _record_message(to, "bot", message)
     return result
+
+
+async def _send_whatsapp_template(to: str, template_name: str, client_name: str) -> Dict[str, Any]:
+    """Send a Cloud API template message with one body variable (Client_name).
+
+    Buttons are assumed to be configured inside the template in Meta.
+    """
+    if not WHATSAPP_PHONE_ID or not WHATSAPP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="WhatsApp credentials not configured")
+    url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": WHATSAPP_TEMPLATE_LANG},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": client_name},
+                    ],
+                }
+            ],
+        },
+    }
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
 
 
 async def _intent_ready_to_book(wa_id: str, convo: Dict[str, Any]) -> bool:
