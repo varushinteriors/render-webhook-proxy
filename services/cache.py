@@ -11,6 +11,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 SESSION_TTL = 86400  # 24h
 WEBHOOK_TTL = 300    # 5 minutes
 SUMMARY_BATCH_SIZE = 5
+CONVERSATION_CACHE_TTL = 86400  # 24h for realtime conversation snapshot
 
 redis_client: redis.Redis | None = None
 if REDIS_URL:
@@ -89,3 +90,30 @@ def mark_webhook(message_id: str) -> bool:
     if success:
         _client().expire(key, WEBHOOK_TTL)
     return bool(success)
+
+
+def update_realtime_message(
+    phone: str,
+    message: str,
+    timestamp: datetime,
+    sender: str,
+    *,
+    conversation_id: int | None = None,
+    lead_id: int | None = None,
+) -> None:
+    payload = {
+        "last_message": message,
+        "timestamp": timestamp.isoformat(),
+        "sender": sender,
+        "conversation_id": conversation_id,
+        "lead_id": lead_id,
+    }
+    key = f"conversation:{phone}"
+    _client().setex(key, CONVERSATION_CACHE_TTL, json.dumps(payload))
+
+
+def health_check() -> bool:
+    try:
+        return bool(_client().ping())
+    except redis.RedisError:
+        return False

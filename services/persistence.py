@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import List, Sequence
 
 import psycopg
@@ -20,57 +21,89 @@ def _pool() -> ConnectionPool:
     return _pg_pool
 
 
-def upsert_lead(
-    *,
-    source: str,
-    phone: str,
-    name: str | None = None,
-    location: str | None = None,
-    project_type: str | None = None,
-    area: str | None = None,
-    budget: str | None = None,
-    timeline: str | None = None,
-    finish: str | None = None,
-) -> None:
+def upsert_lead(phone: str, name: str | None = None, location: str | None = None) -> int:
+    if not phone:
+        raise ValueError("phone is required")
+    fallback_name = name or f"WhatsApp Lead {phone[-4:]}" if phone else "WhatsApp Lead"
     query = """
-        INSERT INTO leads (source, phone, name, location, project_type, area, budget, timeline, finish)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO leads (name, phone, location)
+        VALUES (%s, %s, %s)
         ON CONFLICT (phone) DO UPDATE SET
-            source = EXCLUDED.source,
-            name = EXCLUDED.name,
-            location = EXCLUDED.location,
-            project_type = EXCLUDED.project_type,
-            area = EXCLUDED.area,
-            budget = EXCLUDED.budget,
-            timeline = EXCLUDED.timeline,
-            finish = EXCLUDED.finish;
+            name = COALESCE(EXCLUDED.name, leads.name),
+            location = COALESCE(EXCLUDED.location, leads.location),
+            updated_at = NOW()
+        RETURNING id;
     """
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                query,
-                (source, phone, name, location, project_type, area, budget, timeline, finish),
-            )
+            cur.execute(query, (fallback_name, phone, location))
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Failed to upsert lead")
+            return int(row[0])
 
 
-def log_conversation(phone: str, role: str, message: str) -> None:
+def ensure_conversation(lead_id: int) -> int:
+    select_query = "SELECT id FROM conversations WHERE lead_id = %s LIMIT 1"
+    insert_query = """
+        INSERT INTO conversations (lead_id, unread_count, is_live)
+        VALUES (%s, 0, TRUE)
+        RETURNING id;
+    """
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(select_query, (lead_id,))
+            row = cur.fetchone()
+            if row:
+                return int(row[0])
+            cur.execute(insert_query, (lead_id,))
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Failed to create conversation row")
+            return int(row[0])
+
+
+def insert_message(
+    conversation_id: int,
+    sender: str,
+    content: str,
+    *,
+    message_type: str = "text",
+    sent_at: datetime | None = None,
+) -> int:
+    if not sent_at:
+        sent_at = datetime.now(timezone.utc)
     query = """
-        INSERT INTO conversations (phone, role, message)
-        VALUES (%s, %s, %s);
+        INSERT INTO messages (conversation_id, sender, content, message_type, sent_at)
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id;
     """
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, (phone, role, message))
+            cur.execute(query, (conversation_id, sender, content, message_type, sent_at))
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Failed to insert message")
+            return int(row[0])
 
 
-def log_booking(phone: str, meeting_time: str, meeting_link: str, status: str) -> None:
+def update_conversation(conversation_id: int, last_message: str, sent_at: datetime, sender: str) -> None:
+    role = (sender or "").lower()
     query = """
-        INSERT INTO bookings (phone, meeting_time, meeting_link, status)
-        VALUES (%s, %s, %s, %s);
+        UPDATE conversations
+        SET last_message = %s,
+            last_message_time = %s,
+            unread_count = CASE %s
+                WHEN 'client' THEN unread_count + 1
+                WHEN 'designer' THEN 0
+                ELSE unread_count
+            END,
+            updated_at = NOW()
+        WHERE id = %s;
     """
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, (phone, meeting_time, meeting_link, status))
+            cur.execute(query, (last_message, sent_at, role, conversation_id))
 
 
 def store_embedding(phone: str, message: str, embedding: Sequence[float]) -> None:
@@ -83,7 +116,7 @@ def store_embedding(phone: str, message: str, embedding: Sequence[float]) -> Non
             cur.execute(query, (phone, message, list(embedding)))
 
 
-def similar_messages(query_embedding: Sequence[float], limit: int = 3) -> List[str]:
+def similar_messages(query_embedding: Sequence[float], limit: int = 5) -> List[str]:
     query = """
         SELECT message
         FROM conversation_embeddings
@@ -95,3 +128,24 @@ def similar_messages(query_embedding: Sequence[float], limit: int = 3) -> List[s
             cur.execute(query, (list(query_embedding), limit))
             rows = cur.fetchall()
     return [row["message"] for row in rows]
+
+
+def log_booking(phone: str, meeting_time: str, meeting_link: str, status: str) -> None:
+    query = """
+        INSERT INTO bookings (phone, meeting_time, meeting_link, status)
+        VALUES (%s, %s, %s, %s);
+    """
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (phone, meeting_time, meeting_link, status))
+
+
+def health_check() -> bool:
+    try:
+        with _pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+        return True
+    except Exception:
+        return False
