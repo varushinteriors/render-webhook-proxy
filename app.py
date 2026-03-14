@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 import mimetypes
@@ -23,12 +24,20 @@ from pydantic import BaseModel
 from agents.lead_scoring import LeadInput, LeadScoringAgent
 from services.conversation_agent import ConversationAgent, ConversationAgentResult
 from services import cache, persistence
+from scripts import messages as msgcopy
 
 app = FastAPI()
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    # Phase 0: create raw-event storage tables (backward compatible; guarded by env flag).
+    try:
+        persistence.ensure_whatsapp_event_tables()
+    except Exception as exc:
+        # Never block startup for observability-only storage.
+        print(f"WARN: wa_raw_events table init failed: {exc}")
+
     asyncio.create_task(_inactivity_watcher())
     asyncio.create_task(_meeting_reminder_watcher())
     print("VARUSH WEBHOOK SERVER STARTED")
@@ -63,6 +72,15 @@ MEDIA_ARCHIVE_PATH.mkdir(parents=True, exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+
+# Phase 2: canary routing (allowlist) to the WA orchestrator API.
+WA_CANARY_ALLOWLIST = {
+    n.strip()
+    for n in (os.getenv("WA_CANARY_ALLOWLIST", "") or "").split(",")
+    if n.strip()
+}
+WA_CANARY_TIMEOUT_SEC = float(os.getenv("WA_CANARY_TIMEOUT_SEC", "8") or "8")
+WA_ORCH_API_URL = (os.getenv("WA_ORCH_API_URL", "http://wa_orchestrator_api:8090") or "").rstrip("/")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "").strip()
 LEAD_ACCESS_TOKEN = PAGE_ACCESS_TOKEN
 if not LEAD_ACCESS_TOKEN:
@@ -482,7 +500,6 @@ def _is_admin_wa(wa_id: str | None) -> bool:
 
 
 QUESTION_FLOW = [
-    "name",
     "service_type",
     "location",
     "project_type",
@@ -492,25 +509,25 @@ QUESTION_FLOW = [
     "finish",
     "assets",
     "portfolio",
+    "name",
 ]
 
 QUESTION_PROMPTS = {
-    "name": "Hi there! 👋 I’m Kavya from Varush Architect & Interiors. May I have your name?",
-    "service_type": "Thanks {name}! What type of service are you looking for—interior design, architectural services, turnkey, or something else?",
-    "location": "Got it. Where is the project located? (Delhi, Gurugram, Faridabad, Noida, or another city—please mention.)",
-    "project_type": "What type of project is it (e.g., 2/3/4 BHK flat, villa, farmhouse, independent house, office space, etc.)?",
-    "area": "Approximately how many square feet is the space?",
-    "timeline": "When are you planning to start? (Immediately, within 3 months, within 6 months?)",
-    "finish": "What finish level would you like—budget-friendly, premium, or luxury?",
-    "budget": "What budget bracket should we plan for? (<10 lacs, 10–20 lacs, 20–30 lacs, >30 lacs, or flexible as per design.)",
+    "service_type": "What service do you need—interior design, turnkey execution, renovation, or something else?",
+    "location": "Which city is the project in? (Delhi / Gurugram / Noida / Faridabad / other)",
+    "project_type": "Is this for a 2/3/4 BHK, villa, office, or something else?",
+    "area": "Approx area/sqft?",
+    "budget": "Rough budget range (in ₹ lakhs)?",
+    "timeline": "When are you hoping to start?",
+    "finish": "Preferred finish level—Budget / Premium / Luxury?",
     "assets": (
-        "Could you share any of the following?\n"
-        "• Layout plan / floor plan\n"
-        "• Site or current project photos\n"
-        "• Inspiration or mood-board images\n"
-        "Send whatever you have, one upload at a time, and I’ll organize them on your project board."
+        "If you have any of these, you can share now (one at a time):\n"
+        "• layout/floor plan\n"
+        "• site/current photos\n"
+        "• inspiration images"
     ),
-    "portfolio": f"Would you like to see our latest work portfolio? Here’s a quick look: {PORTFOLIO_LINK}",
+    "portfolio": f"Want to see our latest work portfolio? {PORTFOLIO_LINK}",
+    "name": "Quickly—what name should I save this under?",
 }
 
 CHATTER_RESPONSES = {
@@ -746,8 +763,8 @@ ESCALATION_THRESHOLD = 2
 CONFIDENCE_MIN_SCORE = 0.6
 RECAP_COOLDOWN_SECONDS = 3600
 
-INACTIVITY_INITIAL_DELAY = 180  # seconds (3 minutes)
-INACTIVITY_INTERVAL = 60  # seconds between nudges
+INACTIVITY_INITIAL_DELAY = 600  # seconds (10 minutes)
+INACTIVITY_INTERVAL = 600  # seconds between nudges
 INACTIVITY_MESSAGES = [
     "Just checking in 😊 If you have a minute now, I can jot down the next detail and keep things moving for your space.",
     "I don’t want you to lose the momentum—you’ll be amazed how quickly we can map ideas once we have these basics. Shall we pick up where we left off?",
@@ -838,11 +855,81 @@ async def verify(
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     payload = await request.json()
+
+    # Phase 0/2: persist immutable raw webhook events.
+    raw_event_id = None
+    wa_from = None
+    try:
+        # Deterministic hashing for idempotency across retries.
+        dedupe_src = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        dedupe_key = hashlib.sha256(dedupe_src).hexdigest()
+
+        # Best-effort extraction.
+        object_type = payload.get("object")
+        wa_phone_id = None
+        wa_message_id = None
+        provider_event_id = None
+        try:
+            entry0 = (payload.get("entry") or [None])[0] or {}
+            changes0 = (entry0.get("changes") or [None])[0] or {}
+            value = changes0.get("value") or {}
+            metadata = value.get("metadata") or {}
+            wa_phone_id = metadata.get("phone_number_id")
+            messages0 = (value.get("messages") or [None])[0] or {}
+            wa_from = messages0.get("from")
+            wa_message_id = messages0.get("id")
+            provider_event_id = wa_message_id
+        except Exception:
+            pass
+
+        headers = {
+            "x-hub-signature-256": request.headers.get("x-hub-signature-256"),
+            "x-hub-signature": request.headers.get("x-hub-signature"),
+            "user-agent": request.headers.get("user-agent"),
+        }
+        raw_event_id = persistence.insert_wa_raw_event(
+            dedupe_key=dedupe_key,
+            payload=payload,
+            headers=headers,
+            object_type=object_type,
+            provider_event_id=provider_event_id,
+            wa_phone_id=wa_phone_id,
+            wa_from=wa_from,
+            wa_message_id=wa_message_id,
+        )
+        if raw_event_id is None:
+            raw_event_id = persistence.get_wa_raw_event_id_by_dedupe_key(dedupe_key)
+    except Exception as exc:
+        print(f"WARN: wa_raw_event insert failed: {exc}")
+
     if payload.get("object") == "page":
         await _handle_leadgen_payload(payload)
+        # Step 1: persist leadgen event for admin stats
+        try:
+            persistence.insert_leadgen_event(lead_phone=None, payload=payload)
+        except Exception as exc:
+            print(f"WARN: leadgen event persist failed: {exc}")
+
+        # Step 3: admin notification for leadgen submissions (best-effort)
+        try:
+            if ADMIN_ALERT_NUMBERS:
+                dedupe_src = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+                dedupe_key = hashlib.sha256(dedupe_src).hexdigest()
+                if persistence.admin_notify_should_send("Leadgen submission", dedupe_key):
+                    note = "[WA BOT] New lead form submission received (Leadgen). Check dashboard."
+                    for n in ADMIN_ALERT_NUMBERS:
+                        await _send_whatsapp_text(n, note, False)
+        except Exception as exc:
+            print(f"WARN: leadgen admin notify failed: {exc}")
         return {"status": "ok"}
+
     _append_log(payload)
     await _forward(payload)
+
+    # Orchestrator/canary routing DISABLED.
+    # All user replies must be generated directly by this app.py controller to avoid confusion.
+    # (Admin + designer numbers still follow their dedicated flows inside _auto_reply.)
+
     await _auto_reply(payload)
     return {"status": "ok"}
 
@@ -1210,11 +1297,11 @@ async def _summarize_overflow(entries: List[Dict[str, str]]) -> str:
     if not transcript:
         return ""
     try:
-        response = await client.responses.create(
+        response = await client.chat.completions.create(
             model=SUMMARY_MODEL,
-            input=[
-                {"role": "system", "content": [{"type": "input_text", "text": SUMMARY_PROMPT}]},
-                {"role": "user", "content": [{"type": "input_text", "text": transcript}]},
+            messages=[
+                {"role": "system", "content": SUMMARY_PROMPT},
+                {"role": "user", "content": transcript},
             ],
         )
         summary = conversation_agent._extract_text(response)  # type: ignore[attr-defined]
@@ -1341,6 +1428,13 @@ async def _handle_conversation_turn(wa_id: str, contact_name: str | None, incomi
         _save_state(state)
         _score_lead_from_conversation(wa_id, convo)
         return
+
+    if convo.get("status") == "awaiting_meeting" and incoming_text:
+        handled_request = await _handle_meeting_date_request(wa_id, convo, incoming_text)
+        if handled_request:
+            state[wa_id] = convo
+            _save_state(state)
+            return
 
     active_meeting = _get_active_meeting_record(wa_id)
     wants_cancel = bool(incoming_text and _detect_cancel_request(incoming_text))
@@ -1659,15 +1753,18 @@ def _create_meeting_record(
         "reminders_sent": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "created_by": admin_wa or "auto",
-        "meet_link": _build_meet_link(meeting_id),
+        "meet_link": None,
+        "meeting_provider": "zoom",
     }
+
     zoom_link = _create_zoom_meeting(record, slot_dt, client_name)
-    if zoom_link:
-        record["meet_link"] = zoom_link
-    calendar_link = _create_calendar_event(record, slot_dt, client_name)
-    if calendar_link and not record.get("meeting_provider"):
-        record["meet_link"] = calendar_link
-        record["meeting_provider"] = "google"
+    if not zoom_link:
+        return False, "Sorry—Zoom link generation failed. Please share another preferred time window and we’ll confirm manually."
+
+    record["meet_link"] = zoom_link
+
+    # Optional: still create a calendar event for internal tracking, but never generate/send a Google Meet link.
+    _create_calendar_event(record, slot_dt, client_name)
     meetings.append(record)
     _save_meetings(meetings)
     try:
@@ -1957,8 +2054,8 @@ async def _run_legacy_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, A
                 await _send_whatsapp_text(wa_id, welcome, preview_url=False)
                 _append_history(convo, "bot", welcome)
             convo["has_welcomed"] = True
-        await _send_meeting_prompt(wa_id, convo)
-        convo["status"] = "awaiting_meeting"
+        await _send_meeting_pitch(wa_id, convo)
+        convo["status"] = STATUS_MEETING_PITCH
         convo["awaiting_field"] = None
         convo["awaiting_origin"] = None
     else:
@@ -2054,7 +2151,7 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
             label = SUMMARY_FIELD_LABELS.get(field, field.replace("_", " ").title())
             summary_lines.append(f"{label}: {value}")
         summary_text = "; ".join(summary_lines)
-        reply_parts.append(f"Noted — {summary_text}. Need to tweak anything? Just let me know.")
+        reply_parts.append(f"Got it — {summary_text} ✅")
     if uncertain_fields:
         clarifications = []
         for field, value in uncertain_fields:
@@ -2067,19 +2164,14 @@ async def _run_agent_flow(wa_id: str, convo: Dict[str, Any], state: Dict[str, An
         reply_parts.append(ASSET_UPLOAD_CONFIRMATION)
         convo["asset_upload_prompted"] = True
 
+    # IMPORTANT: avoid controller-synthesized bundled prompts.
+    # Always rely on the LLM's follow_up_prompt / next_field (prevents multi-question spam).
     bundle_prompt: str | None = None
     bundle_fields: List[str] = []
-    if not skip_forced_follow and convo.get("phase") in {PHASE_DISCOVERY, PHASE_QUALIFICATION}:
-        bundle_prompt, bundle_fields = _build_bundled_followup(convo)
 
     follow_up_prompt = result.follow_up_prompt.strip() if result.follow_up_prompt else None
-    allow_bundle = bool(bundle_prompt and (not next_field or next_field in bundle_fields))
 
-    if allow_bundle:
-        reply_parts.append(bundle_prompt)
-        if bundle_fields:
-            follow_field = bundle_fields[0]
-    elif follow_up_prompt and not skip_forced_follow:
+    if follow_up_prompt and not skip_forced_follow:
         reply_parts.append(follow_up_prompt)
         if next_field:
             follow_field = next_field
@@ -2463,28 +2555,14 @@ def _needs_value_confirmation(field: str, value: str) -> bool:
 
 
 def _build_welcome_message(convo: Dict[str, Any]) -> str:
-    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
-    answers = convo.get("answers", {})
-    snippets: List[str] = []
-    if answers.get("service_type"):
-        snippets.append(f"you're looking for {answers['service_type'].lower()} support")
-    if answers.get("project_type"):
-        snippets.append(f"for a {answers['project_type']}")
-    if answers.get("location"):
-        snippets.append(f"in {answers['location']}")
-    if answers.get("budget"):
-        snippets.append(f"with a budget around {answers['budget']}")
-    if answers.get("timeline"):
-        snippets.append(f"and a timeline of {answers['timeline']}")
-    known_text = ", ".join(snippets)
-    if known_text:
-        summary = f"I noted that {known_text}."
-    else:
-        summary = "I'll grab a few quick details so we can tailor everything perfectly."
-    return (
-        f"Hi {name}! 👋 Thanks for choosing Varush Architect & Interiors. {summary} "
-        "I’ll ask only what’s needed and skip anything you’ve already shared."
-    )
+    """Single warm welcome. Service-first (no location-first)."""
+    name = convo.get("contact_name") or convo.get("answers", {}).get("name")
+    if name:
+        return (
+            f"Hi {name}! 👋✨ Welcome to Varush Architect & Interiors.\n"
+            "What are you looking for—interior design, turnkey execution, renovation, or something else?"
+        )
+    return msgcopy.WELCOME_MESSAGE
 
 
 def _next_missing_field(convo: Dict[str, Any]) -> str | None:
@@ -2525,23 +2603,7 @@ def _phone_key_from_wa(wa_id: str) -> str | None:
 
 
 async def _send_meeting_pitch(wa_id: str, convo: Dict[str, Any]) -> None:
-    answers = convo.get("answers", {})
-    name = convo.get("contact_name") or answers.get("name") or "there"
-    parts = []
-    if answers.get("service_type"):
-        parts.append(answers.get("service_type").lower())
-    if answers.get("project_type"):
-        parts.append(answers.get("project_type"))
-    if answers.get("location"):
-        parts.append(f"in {answers.get('location')}")
-    if answers.get("area"):
-        parts.append(f"around {answers.get('area')} sq.ft")
-    context = ", ".join(parts)
-    intro = f"{name}, we now have the essentials" if not context else f"{name}, we now have the essentials for your {context}"
-    message = (
-        f"{intro}. How about a complimentary 10-min call with our lead designer? You’ll walk away with an instant realistic quote, fresh design ideas tailored to your layout, and a quick walkthrough of how our interior design process works—even if you don’t hire us. "
-        "Should I line up a slot for you?"
-    )
+    message = msgcopy.CONSULT_PITCH
     await _send_whatsapp_text(wa_id, message, preview_url=False)
     _append_history(convo, "bot", message)
     convo["meeting_pitch_meta"] = {
@@ -2592,25 +2654,140 @@ async def _handle_meeting_pitch_reply(wa_id: str, convo: Dict[str, Any], incomin
 
 
 async def _send_meeting_prompt(wa_id: str, convo: Dict[str, Any]) -> None:
-    name = convo.get("contact_name") or convo.get("answers", {}).get("name") or "there"
     slots = _generate_meeting_slots()
     if slots:
-        slot_lines = [f"{i+1}. {slot['label']}" for i, slot in enumerate(slots)]
-        slot_text = "\n".join(slot_lines)
-        message = (
-            f"Thanks, {name}! I have all the essentials. Let’s schedule a complimentary 10-min session with our designer.\n"
-            f"Here are the next available slots:\n{slot_text}\n\n"
-            f"Reply with the slot number that works best, and I’ll confirm it plus share the meeting link."
-        )
+        # Use the new WhatsApp-friendly slot script (no link yet).
+        first_dt = _parse_meeting_time(slots[0].get("start"))
+        day_label = first_dt.astimezone(IST).strftime("%a, %d %b") if first_dt else "tomorrow"
+        message = msgcopy.SLOT_MESSAGE.format(day=day_label)
     else:
-        message = (
-            f"Thanks, {name}! We’re fully booked in the next few days. Share a date/time that suits you and I’ll check with the team right away."
-        )
-    await _send_whatsapp_text(wa_id, message, preview_url=True)
+        message = "We’re fully booked over the next few days. Share a day/time that suits you and I’ll check with the team right away."
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
     _append_history(convo, "bot", message)
     offer = convo.setdefault("meeting_offer", {})
     offer["sent_at"] = datetime.now(timezone.utc).isoformat()
     offer["slots"] = slots
+
+
+def _parse_requested_meeting_date(text: str) -> date | None:
+    """Parse simple date requests like '17 March' / '17 Mar' / '17th March'.
+
+    We only need lightweight parsing for WhatsApp scheduling.
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+
+    month_map = {
+        "jan": 1,
+        "january": 1,
+        "feb": 2,
+        "february": 2,
+        "mar": 3,
+        "march": 3,
+        "apr": 4,
+        "april": 4,
+        "may": 5,
+        "jun": 6,
+        "june": 6,
+        "jul": 7,
+        "july": 7,
+        "aug": 8,
+        "august": 8,
+        "sep": 9,
+        "sept": 9,
+        "september": 9,
+        "oct": 10,
+        "october": 10,
+        "nov": 11,
+        "november": 11,
+        "dec": 12,
+        "december": 12,
+    }
+
+    import re
+
+    # e.g. 17 March, 17th Mar
+    match = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b", lowered)
+    if not match:
+        return None
+
+    day = int(match.group(1))
+    month_token = match.group(2)
+    month = month_map.get(month_token)
+    if not month:
+        return None
+
+    today_ist = datetime.now(IST).date()
+    year = today_ist.year
+
+    try:
+        candidate = date(year, month, day)
+    except ValueError:
+        return None
+
+    # If they mention a date that already passed this year, assume next year.
+    if candidate < today_ist:
+        try:
+            candidate = date(year + 1, month, day)
+        except ValueError:
+            return None
+
+    return candidate
+
+
+def _build_fixed_slots_for_date(day: date) -> list[dict]:
+    """Return 3 fixed slots at 12:20/1:20/2:20 PM IST for the given date."""
+    slot_times = [(12, 20), (13, 20), (14, 20)]
+    slots: list[dict] = []
+    for hr, minute in slot_times:
+        start_local = datetime(day.year, day.month, day.day, hr, minute, tzinfo=IST)
+        slots.append(
+            {
+                "start": start_local.astimezone(timezone.utc).isoformat(),
+                "label": start_local.strftime("%a, %d %b · %I:%M %p IST"),
+            }
+        )
+    return slots
+
+
+async def _handle_meeting_date_request(wa_id: str, convo: Dict[str, Any], incoming_text: str) -> bool:
+    """Handle requests like '17 March' / 'show available slots' while awaiting meeting selection."""
+    if not incoming_text:
+        return False
+
+    requested = _parse_requested_meeting_date(incoming_text)
+    wants_slots = "slot" in incoming_text.lower() or "availability" in incoming_text.lower()
+
+    stored = convo.get("meeting_requested_date")
+    stored_day = None
+    if stored:
+        try:
+            stored_day = date.fromisoformat(stored)
+        except ValueError:
+            stored_day = None
+
+    target_day = requested or stored_day
+    if not target_day:
+        # If they didn't provide a date, ask for it once.
+        if wants_slots:
+            await _send_whatsapp_text(wa_id, "Sure — which date works for you? (e.g., 17 March)", preview_url=False)
+            _append_history(convo, "bot", "Sure — which date works for you? (e.g., 17 March)")
+            return True
+        return False
+
+    convo["meeting_requested_date"] = target_day.isoformat()
+    slots = _build_fixed_slots_for_date(target_day)
+
+    day_label = datetime(target_day.year, target_day.month, target_day.day, 9, 0, tzinfo=IST).strftime("%a, %d %b")
+    message = msgcopy.SLOT_MESSAGE.format(day=day_label)
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
+    _append_history(convo, "bot", message)
+
+    offer = convo.setdefault("meeting_offer", {})
+    offer["sent_at"] = datetime.now(timezone.utc).isoformat()
+    offer["slots"] = slots
+    return True
 
 
 async def _handle_meeting_offer_selection(wa_id: str, convo: Dict[str, Any], incoming_text: str | None) -> bool:
@@ -2628,9 +2805,20 @@ async def _handle_meeting_offer_selection(wa_id: str, convo: Dict[str, Any], inc
         await _send_whatsapp_text(wa_id, str(payload), preview_url=False)
         return True
     record = payload
-    link = record.get("meet_link") or MEETING_LINK
-    message = f"Locked {selection['label']}. Join via {link}."
-    await _send_whatsapp_text(wa_id, message, preview_url=True)
+    link = (record.get("meet_link") or "").strip()
+    if not link:
+        await _send_whatsapp_text(
+            wa_id,
+            "I booked the slot, but I’m having trouble generating the Zoom link right now. I’m alerting the team—please share an alternate time window as backup.",
+            preview_url=False,
+        )
+        return True
+
+    slot_dt_local = datetime.fromisoformat(selection["start"]).astimezone(IST)
+    date_label = slot_dt_local.strftime("%a, %d %b")
+    time_label = slot_dt_local.strftime("%I:%M %p IST")
+    message = msgcopy.CONFIRM_BOOKING.format(date_label=date_label, time_label=time_label, link=link)
+    await _send_whatsapp_text(wa_id, message, preview_url=False)
     _append_history(convo, "bot", message)
     convo["meeting_offer"] = {}
     convo["completed"] = True
@@ -3342,6 +3530,17 @@ def _format_timestamp(ts: str | None) -> str:
 async def _send_whatsapp_text(to: str, message: str, preview_url: bool) -> Dict[str, Any]:
     if not WHATSAPP_PHONE_ID or not WHATSAPP_ACCESS_TOKEN:
         raise HTTPException(status_code=500, detail="WhatsApp credentials not configured")
+
+    # Duplicate response protection (prevents loops when webhooks retry or the orchestrator double-sends).
+    phone = _normalize_phone(to) or to
+    new_message = (message or "").strip()
+    if new_message:
+        last_message = cache.get_string(f"last_bot_message:{phone}")
+        if last_message == new_message:
+            print("DUPLICATE MESSAGE SKIPPED")
+            return {"skipped": True}
+        cache.set_string(f"last_bot_message:{phone}", new_message, ttl_seconds=3600)
+
     url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
     payload = {
         "messaging_product": "whatsapp",
@@ -3359,6 +3558,42 @@ async def _send_whatsapp_text(to: str, message: str, preview_url: bool) -> Dict[
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     result = resp.json()
     await _record_message(to, "bot", message)
+    return result
+
+
+async def _send_whatsapp_document(
+    to: str,
+    *,
+    document_url: str,
+    filename: str | None = None,
+    caption: str | None = None,
+) -> Dict[str, Any]:
+    if not WHATSAPP_PHONE_ID or not WHATSAPP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="WhatsApp credentials not configured")
+    url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
+    doc: Dict[str, Any] = {"link": document_url}
+    if filename:
+        doc["filename"] = filename
+    if caption:
+        doc["caption"] = caption
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "document",
+        "document": doc,
+    }
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    result = resp.json()
+    # record caption as the message content (best-effort)
+    if caption:
+        await _record_message(to, "bot", caption)
     return result
 
 

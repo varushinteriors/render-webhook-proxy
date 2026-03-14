@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
+from services import token_monitor
+
 ALLOWED_INTENTS = [
     "new_info",
     "clarification",
@@ -12,6 +14,9 @@ ALLOWED_INTENTS = [
     "ready_to_book",
     "ask_portfolio",
     "pricing_query",
+    "timeline_query",
+    "business_info",
+    "acknowledgement",
     "objection",
     "confusion",
     "handoff",
@@ -24,10 +29,11 @@ FIELDS_SCHEMA_PROPERTIES = {field: {"type": "string"} for field in INTAKE_FIELDS
 
 SYSTEM_PROMPT = (
     'You are Kavya, the WhatsApp assistant for Varush Architect & Interiors. Speak warmly, stay focused on scheduling a design session, and return ONLY JSON that matches the schema. '
-    'Allowed intents: new_info, clarification, edit_request, ready_to_book, ask_portfolio, pricing_query, objection, confusion, handoff, smalltalk, unknown. '
+    'IMPORTANT: Reply in the same language and script as the client’s last message. If the client writes in Hindi (Devanagari), reply in Hindi. If they write Hinglish (Hindi in Latin script), reply in Hinglish. Otherwise reply in English. '
+    'Allowed intents: new_info, clarification, edit_request, ready_to_book, ask_portfolio, pricing_query, timeline_query, business_info, acknowledgement, objection, confusion, handoff, smalltalk, unknown. '
     'Treat greetings/polite chatter (hi, hello, hey, good morning, thanks, ok, nice, cool, hmm, great, etc.) as smalltalk: acknowledge briefly, do NOT update any fields, then guide the client back to the next best intake question. '
     'When basics are missing, feel free to bundle them (“Tell me the location, property type, and approximate size”) so the client can reply in one go. '
-    'Extract as many useful details as you can from each message before asking anything else, and skip new questions entirely whenever the user is objecting or just making small talk. '
+    'Only extract intake fields when the message clearly contains project information such as location, size, property type, timeline, or budget. Never extract fields from greetings, objections, complaints, questions about the process, or smalltalk. '
     'If you need an answer, set `next_field` plus a clear `follow_up_prompt`; otherwise leave both blank so the controller never invents a scripted prompt. '
     'Ask at most one question per reply. '
     'Let the conversation flow naturally—never rapid-fire the full intake list. If the user expresses confusion or objects ("why so many questions?", "not hiring a designer"), set intent to objection or confusion, explain briefly why the detail helps, highlight the 45-day guarantee + direct factory-to-project delivery + our in-house expert designers, and only then offer a single gentle next step. '
@@ -121,6 +127,7 @@ class ConversationAgent:
         phase: Optional[str],
         summary: Optional[str] = None,
         relevant_memory: Optional[List[str]] = None,
+        client_language: Optional[str] = None,
     ) -> Optional[ConversationAgentResult]:
         if not self.client:
             return None
@@ -135,11 +142,14 @@ class ConversationAgent:
         phase_text = phase or "discovery"
         summary_text = summary.strip() if summary else "(no summary yet)"
         context_block = "\n".join(f"- {item}" for item in (relevant_memory or [])) or "(no similar memories found)"
+        lang_hint = client_language or "auto"
         user_prompt = (
             f"Client name: {name}\n"
+            f"Client language preference: {lang_hint}\n"
             f"Known answers JSON: {answers_text}\n"
             f"Missing fields (in order): {missing_text}\n"
-            f"Awaiting specific field: {awaiting_text}\n"
+            f"Awaiting specific field (highest priority): {awaiting_text}\n"
+            f"If the client message clearly answers this field, extract it immediately.\n"
             f"Current phase: {phase_text}\n"
             f"Portfolio link: {portfolio_link}\n"
             f"Treat these keywords as pure smalltalk: {smalltalk_hint}.\n"
@@ -159,21 +169,26 @@ class ConversationAgent:
         print(f"LLM SUMMARY: {summary_text}")
         print(f"LLM MODEL USED: {self.model}")
         try:
-            response = await self.client.responses.create(
+            response = await self.client.chat.completions.create(
                 model=self.model,
-                input=[
-                    {
-                        "role": "system",
-                        "content": [{"type": "input_text", "text": SYSTEM_PROMPT}],
-                    },
-                    {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": user_prompt}],
-                    },
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
                 ],
                 response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
             )
             print("LLM RESPONSE RECEIVED")
+            try:
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    token_monitor.log_token_usage(
+                        agent_name="conversation_agent",
+                        model=str(self.model),
+                        usage=usage,
+                        task_type=str(phase_text or "chat_reply"),
+                    )
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"TOKEN MONITOR ERROR: {exc}")
         except Exception as exc:  # pylint: disable=broad-except
             print(f"LLM ERROR: {exc}")
             return None
@@ -184,15 +199,40 @@ class ConversationAgent:
             return None
         try:
             data = json.loads(content)
-            print(f"LLM PARSED RESULT: {data}")
         except json.JSONDecodeError:
             print("LLM JSON DECODE ERROR:", content)
             return None
+
+        confidence = float(data.get("confidence", 1.0))
+        if confidence < 0.6:
+            print("LOW CONFIDENCE DETECTED — forcing clarification")
+            data["intent"] = "clarification"
+            data["fields_detected"] = {}
+            data["next_field"] = None
+
+        validated_fields = {
+            k: str(v).strip()
+            for k, v in (data.get("fields_detected") or {}).items()
+            if k in INTAKE_FIELDS and str(v).strip()
+        }
+
+        print("\n================ INTENT DEBUG ================")
+        print(f"USER MESSAGE: {message.strip()}")
+        print(f"INTENT DETECTED: {data.get('intent')}")
+        print(f"CONFIDENCE: {confidence}")
+        print(f"FIELDS DETECTED: {data.get('fields_detected')}")
+        print(f"VALIDATED FIELDS STORED: {validated_fields}")
+        print(f"NEXT FIELD: {data.get('next_field')}")
+        print(f"FOLLOW UP PROMPT: {data.get('follow_up_prompt')}")
+        print(f"REQUEST MEETING: {data.get('request_meeting')}")
+        print(f"NEEDS HUMAN: {data.get('needs_human')}")
+        print("==============================================\n")
+
         return ConversationAgentResult(
             intent=str(data.get("intent", "unknown")),
             reply=str(data.get("reply", "")).strip(),
-            fields_detected={k: str(v).strip() for k, v in (data.get("fields_detected") or {}).items() if str(v).strip()},
-            confidence=float(data.get("confidence", 1.0) or 0.0),
+            fields_detected=validated_fields,
+            confidence=confidence or 0.0,
             follow_up_prompt=(data.get("follow_up_prompt") or None),
             next_field=(data.get("next_field") or None),
             request_meeting=bool(data.get("request_meeting")),
@@ -202,12 +242,11 @@ class ConversationAgent:
 
     @staticmethod
     def _extract_text(response: Any) -> Optional[str]:
-        for item in response.output or []:
-            for content in getattr(item, "content", []) or []:
-                text = getattr(content, "text", None)
-                if text:
-                    return text
-        return None
+        # Chat Completions response
+        try:
+            return response.choices[0].message.content  # type: ignore[attr-defined]
+        except Exception:  # pylint: disable=broad-except
+            return None
 
     @staticmethod
     def _format_history(history: List[Dict[str, Any]]) -> str:
